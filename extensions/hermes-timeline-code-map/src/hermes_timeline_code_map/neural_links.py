@@ -15,7 +15,7 @@ MAX_FEATURE_ENTITIES = 24
 MAX_FEATURE_WORKFLOWS = 12
 DEFAULT_CANDIDATE_LIMIT = 24
 DEFAULT_LINK_LIMIT = 4
-FEATURE_VERSION_MARKER = "feature:v4-semantic-capsule"
+FEATURE_VERSION_MARKER = "feature:v5-temporal-scope"
 
 NEURAL_SCHEMA = """
 CREATE TABLE IF NOT EXISTS neural_node_features (
@@ -74,6 +74,37 @@ _CONCEPT_BODY_KEYS = {
     "concept", "concepts", "semantic_tag", "semantic_tags", "memory_tag", "memory_tags",
     "alias", "aliases", "keyword", "keywords", "topic", "topics", "intent", "intents",
 }
+
+_FRESHNESS_CLASSES = {"market_live", "runtime_state", "episodic", "durable"}
+_TEMPORAL_SCOPE_ALIASES = {
+    "current": "market_live",
+    "intraday": "market_live",
+    "live": "market_live",
+    "market_live": "market_live",
+    "short_term": "market_live",
+    "runtime": "runtime_state",
+    "runtime_state": "runtime_state",
+    "session_state": "runtime_state",
+    "episode": "episodic",
+    "episodic": "episodic",
+    "historical": "episodic",
+    "durable": "durable",
+    "long_term": "durable",
+    "permanent": "durable",
+    "persistent": "durable",
+}
+_DURABLE_DOMAINS = {"memory", "policy", "architecture", "projects", "code", "reasoning", "documentation"}
+_DURABLE_KINDS = {
+    "architecture", "conclusion", "contract", "decision", "knowhow", "playbook",
+    "policy", "preference", "procedure", "repository", "runbook", "symbol",
+}
+_EPISODIC_KINDS = {
+    "action", "analysis", "checkpoint", "diagnosis", "implementation", "lesson",
+    "output", "post_impact_report", "pre_impact_report", "report", "research",
+    "review", "summary", "verification",
+}
+_MARKET_LIVE_KINDS = {"bar", "intraday", "market_pulse", "orderbook", "price", "quote", "snapshot", "tick"}
+_RUNTIME_STATE_KINDS = {"heartbeat", "health", "probe", "status"}
 
 
 def ensure_neural_schema(conn: sqlite3.Connection) -> None:
@@ -156,31 +187,83 @@ def _body_value_and_text(body: Any) -> tuple[Any, str]:
         return body, str(body)
 
 
-def _freshness(domain: str, kind: str, text: str, created_at: str | None) -> tuple[str, str | None]:
-    lowered = text.lower()
-    ttl: dt.timedelta | None = None
-    freshness_class = "episodic"
-    if domain.lower() in {"market", "trading", "investment"} or any(
-        marker in lowered for marker in ("quote", "intraday", "장중", "vix", "as_of", "market pulse")
-    ):
-        freshness_class = "market_live"
-        ttl = dt.timedelta(days=1)
-    elif kind.lower() in {"status", "health", "probe", "heartbeat"} or any(
-        marker in lowered for marker in ("service status", "source_status", "runtime status")
-    ):
-        freshness_class = "runtime_state"
-        ttl = dt.timedelta(days=7)
-    elif domain.lower() in {"memory", "policy", "architecture", "projects", "code", "reasoning"} or kind.lower() in {
-        "contract", "decision", "preference", "conclusion", "repository", "symbol",
-    }:
-        freshness_class = "durable"
+def _normalized_scope(value: Any) -> str | None:
+    token = re.sub(r"[\s-]+", "_", str(value or "").strip().lower())
+    if token in _FRESHNESS_CLASSES:
+        return token
+    return _TEMPORAL_SCOPE_ALIASES.get(token)
 
-    if ttl is None:
-        return freshness_class, None
+
+def _explicit_freshness(body_value: Any) -> tuple[str | None, float | None, str | None]:
+    if not isinstance(body_value, dict):
+        return None, None, None
+    descriptor = body_value.get("memory_descriptor")
+    sources = [descriptor, body_value] if isinstance(descriptor, dict) else [body_value]
+    for source in sources:
+        freshness_class = _normalized_scope(source.get("freshness_class"))
+        if freshness_class is None:
+            freshness_class = _normalized_scope(source.get("temporal_scope"))
+        if freshness_class is None:
+            continue
+        ttl_days: float | None = None
+        try:
+            raw_ttl = source.get("ttl_days")
+            if raw_ttl is not None:
+                candidate_ttl = float(raw_ttl)
+                if 0 < candidate_ttl <= 3650:
+                    ttl_days = candidate_ttl
+        except (TypeError, ValueError):
+            ttl_days = None
+        expires_at = str(source.get("expires_at") or "").strip() or None
+        if expires_at and _parse_iso(expires_at).year == 1970:
+            expires_at = None
+        return freshness_class, ttl_days, expires_at
+    return None, None, None
+
+
+def _expiry(created_at: str | None, ttl_days: float) -> str:
     created = _parse_iso(created_at)
     if created.year == 1970:
         created = dt.datetime.now(dt.timezone.utc)
-    return freshness_class, (created + ttl).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+    return (created + dt.timedelta(days=ttl_days)).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+
+
+def _freshness(
+    domain: str,
+    kind: str,
+    text: str,
+    created_at: str | None,
+    body_value: Any,
+) -> tuple[str, str | None]:
+    explicit_class, explicit_ttl, explicit_expiry = _explicit_freshness(body_value)
+    if explicit_class:
+        if explicit_class in {"durable", "episodic"}:
+            return explicit_class, None
+        if explicit_expiry:
+            return explicit_class, explicit_expiry
+        default_ttl = 1.0 if explicit_class == "market_live" else 7.0
+        return explicit_class, _expiry(created_at, explicit_ttl or default_ttl)
+
+    normalized_domain = domain.lower()
+    normalized_kind = kind.lower()
+    lowered = text.lower()
+
+    # Contracts, decisions, architecture, and accumulated know-how remain durable
+    # even when their text mentions live prices or market workflows.
+    if normalized_domain in _DURABLE_DOMAINS or normalized_kind in _DURABLE_KINDS:
+        return "durable", None
+    # Reports and completed work are historical episodes, not live quotes.
+    if normalized_kind in _EPISODIC_KINDS:
+        return "episodic", None
+    if normalized_kind in _RUNTIME_STATE_KINDS or any(
+        marker in lowered for marker in ("service status", "source_status", "runtime status")
+    ):
+        return "runtime_state", _expiry(created_at, 7.0)
+    if normalized_kind in _MARKET_LIVE_KINDS or normalized_domain in {"market", "trading", "investment"} or any(
+        marker in lowered for marker in ("quote", "intraday", "장중", "vix", "as_of", "market pulse")
+    ):
+        return "market_live", _expiry(created_at, 1.0)
+    return "episodic", None
 
 
 def extract_features(
@@ -215,7 +298,7 @@ def extract_features(
         if filename:
             workflow_terms.append("file:" + filename)
 
-    freshness_class, expires_at = _freshness(domain, kind, combined, created_at)
+    freshness_class, expires_at = _freshness(domain, kind, combined, created_at, body_value)
     return {
         "domain": domain or "unknown",
         "kind": kind or "unknown",
@@ -257,6 +340,7 @@ def _candidate_ids(
     *,
     exclude_node_id: str | None,
     candidate_limit: int,
+    include_expired: bool = False,
 ) -> list[str]:
     clauses: list[str] = []
     params: list[Any] = []
@@ -268,7 +352,6 @@ def _candidate_ids(
         clauses.append(f"(t.term_type=? AND t.term IN ({placeholders}))")
         params.extend([term_type, *values])
 
-    now = _now_iso()
     if clauses:
         query = f"""
             SELECT t.node_id, COUNT(*) AS matches, MAX(n.created_at) AS created_at
@@ -276,9 +359,10 @@ def _candidate_ids(
             JOIN neural_node_features f ON f.node_id=t.node_id
             JOIN nodes n ON n.id=t.node_id
             WHERE ({' OR '.join(clauses)})
-              AND (f.expires_at IS NULL OR f.expires_at >= ?)
         """
-        params.append(now)
+        if not include_expired:
+            query += " AND (f.expires_at IS NULL OR f.expires_at >= ?)"
+            params.append(_now_iso())
         if exclude_node_id:
             query += " AND t.node_id <> ?"
             params.append(exclude_node_id)
@@ -294,9 +378,11 @@ def _candidate_ids(
         FROM neural_node_features f
         JOIN nodes n ON n.id=f.node_id
         WHERE f.domain=? AND f.kind=?
-          AND (f.expires_at IS NULL OR f.expires_at >= ?)
     """
-    params = [features["domain"], features["kind"], now]
+    params = [features["domain"], features["kind"]]
+    if not include_expired:
+        query += " AND (f.expires_at IS NULL OR f.expires_at >= ?)"
+        params.append(_now_iso())
     if exclude_node_id:
         query += " AND f.node_id <> ?"
         params.append(exclude_node_id)
@@ -317,6 +403,14 @@ def _recency_score(created_at: str | None, freshness_class: str) -> float:
         "durable": 365.0,
     }.get(freshness_class, 45.0)
     return math.exp(-math.log(2) * age_days / half_life)
+
+
+def _is_expired(expires_at: str | None, *, now: dt.datetime | None = None) -> bool:
+    if not expires_at:
+        return False
+    parsed = _parse_iso(expires_at)
+    current = now or dt.datetime.now(dt.timezone.utc)
+    return parsed <= current
 
 
 def _score_candidate(
@@ -365,6 +459,8 @@ def _score_candidate(
         score += 0.04
     score += 0.08 * _recency_score(candidate_row["created_at"], candidate_row["freshness_class"])
     score += min(0.06, math.log1p(candidate_row["activation_count"] or 0) * 0.015)
+    if _is_expired(candidate_row["expires_at"]):
+        score *= 0.70
     return min(1.0, score), relation
 
 
@@ -374,12 +470,14 @@ def _rank_candidates(
     *,
     exclude_node_id: str | None = None,
     candidate_limit: int = DEFAULT_CANDIDATE_LIMIT,
+    include_expired: bool = False,
 ) -> list[dict[str, Any]]:
     candidate_ids = _candidate_ids(
         conn,
         features,
         exclude_node_id=exclude_node_id,
         candidate_limit=candidate_limit,
+        include_expired=include_expired,
     )
     if not candidate_ids:
         return []
@@ -416,7 +514,11 @@ def index_node(
     candidate_limit: int = DEFAULT_CANDIDATE_LIMIT,
     link_limit: int = DEFAULT_LINK_LIMIT,
 ) -> dict[str, Any]:
-    existing = conn.execute("SELECT node_id FROM neural_node_features WHERE node_id=?", (node_id,)).fetchone()
+    existing = conn.execute(
+        "SELECT node_id, domain, kind, goal_id, freshness_class, expires_at "
+        "FROM neural_node_features WHERE node_id=?",
+        (node_id,),
+    ).fetchone()
     row = conn.execute("SELECT * FROM nodes WHERE id=?", (node_id,)).fetchone()
     if row is None:
         raise ValueError(f"node {node_id} not found")
@@ -430,6 +532,28 @@ def index_node(
         created_at=row["created_at"] or row["ts"],
     )
     if existing:
+        now = _now_iso()
+        metadata_changed = any(
+            (
+                existing["domain"] != features["domain"],
+                existing["kind"] != features["kind"],
+                existing["goal_id"] != features["goal_id"],
+                existing["freshness_class"] != features["freshness_class"],
+                existing["expires_at"] != features["expires_at"],
+            )
+        )
+        if metadata_changed:
+            conn.execute(
+                """
+                UPDATE neural_node_features
+                SET domain=?, kind=?, goal_id=?, freshness_class=?, expires_at=?, indexed_at=?
+                WHERE node_id=?
+                """,
+                (
+                    features["domain"], features["kind"], features["goal_id"],
+                    features["freshness_class"], features["expires_at"], now, node_id,
+                ),
+            )
         before_changes = conn.total_changes
         for term_type, values in features["terms"].items():
             conn.executemany(
@@ -437,13 +561,15 @@ def index_node(
                 [(node_id, term_type, value) for value in values],
             )
         terms_added = conn.total_changes - before_changes
+        refreshed = metadata_changed or bool(terms_added)
         return {
             "node_id": node_id,
             "indexed": False,
-            "refreshed": bool(terms_added),
+            "refreshed": refreshed,
+            "metadata_changed": metadata_changed,
             "terms_added": terms_added,
             "links_created": 0,
-            "reason": "features_refreshed" if terms_added else "already_indexed",
+            "reason": "features_refreshed" if refreshed else "already_indexed",
         }
     now = _now_iso()
     conn.execute(
@@ -581,7 +707,10 @@ def recall_query(
     max_chars: int = 1800,
     max_depth: int | None = None,
     candidate_mode: bool = False,
+    include_expired: bool | None = None,
 ) -> dict[str, Any]:
+    historical_recall = bool(_DEEP_RECALL_RE.search(query or ""))
+    include_expired_effective = historical_recall if include_expired is None else include_expired
     features = extract_features(
         domain="query",
         kind="request",
@@ -591,7 +720,12 @@ def recall_query(
         goal_id=None,
         created_at=_now_iso(),
     )
-    direct = _rank_candidates(conn, features, candidate_limit=DEFAULT_CANDIDATE_LIMIT)
+    direct = _rank_candidates(
+        conn,
+        features,
+        candidate_limit=DEFAULT_CANDIDATE_LIMIT,
+        include_expired=include_expired_effective,
+    )
     direct_threshold = 0.18 if candidate_mode else 0.30
     direct_limit = 12 if candidate_mode else 8
     direct = [item for item in direct if item["score"] >= direct_threshold][:direct_limit]
@@ -605,26 +739,30 @@ def recall_query(
     if not activations:
         return {
             "query": query, "depth": depth, "candidate_mode": candidate_mode,
+            "historical_recall": historical_recall,
+            "include_expired": include_expired_effective,
             "items": [], "context": "", "chars": 0,
         }
 
     ids = list(activations)
     placeholders = ",".join("?" for _ in ids)
-    rows = conn.execute(
-        f"""
+    rows_query = f"""
         SELECT n.*, f.freshness_class, f.expires_at
         FROM nodes n
         JOIN neural_node_features f ON f.node_id=n.id
         WHERE n.id IN ({placeholders})
-          AND (f.expires_at IS NULL OR f.expires_at >= ?)
-        """,
-        tuple(ids) + (_now_iso(),),
-    ).fetchall()
+    """
+    row_params: tuple[Any, ...] = tuple(ids)
+    if not include_expired_effective:
+        rows_query += " AND (f.expires_at IS NULL OR f.expires_at >= ?)"
+        row_params += (_now_iso(),)
+    rows = conn.execute(rows_query, row_params).fetchall()
     items: list[dict[str, Any]] = []
     for row in rows:
         info = activations[row["id"]]
         activation = float(info["activation"])
         activation *= 0.85 + 0.15 * _recency_score(row["created_at"], row["freshness_class"])
+        expired = _is_expired(row["expires_at"])
         items.append(
             {
                 "id": row["id"],
@@ -634,6 +772,9 @@ def recall_query(
                 "kind": row["kind"],
                 "goal_id": row["goal_id"],
                 "created_at": row["created_at"],
+                "freshness_class": row["freshness_class"],
+                "expires_at": row["expires_at"],
+                "freshness_status": "expired" if expired else "current",
                 "activation": round(activation, 4),
                 "hop": info["hop"],
                 "relation": info["relation"],
@@ -648,12 +789,19 @@ def recall_query(
         else "[Timeline NeuralLink: 관련 과거 맥락]"
     )
     lines = [header]
+    if include_expired_effective:
+        lines.append(
+            "[STALE/EXPIRED 후보는 당시 증거일 뿐 현재값이 아니므로 사용 전 재검증]"
+        )
     kept: list[dict[str, Any]] = []
     for item in items:
         line = (
             f"- {item['title']} (hop={item['hop']}, relation={item['relation']}, "
-            f"activation={item['activation']}, at={item['created_at']})"
+            f"activation={item['activation']}, at={item['created_at']}"
         )
+        if item["freshness_status"] == "expired":
+            line += f", freshness=STALE/EXPIRED, expired_at={item['expires_at']}"
+        line += ")"
         if item["summary"]:
             line += f": {item['summary']}"
         candidate = "\n".join([*lines, line])
@@ -666,6 +814,8 @@ def recall_query(
         "query": query,
         "depth": depth,
         "candidate_mode": candidate_mode,
+        "historical_recall": historical_recall,
+        "include_expired": include_expired_effective,
         "items": kept,
         "context": context,
         "chars": len(context),

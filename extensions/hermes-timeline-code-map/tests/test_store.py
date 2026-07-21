@@ -9,6 +9,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from unittest import mock
 
+from hermes_timeline_code_map.neural_links import FEATURE_VERSION_MARKER
 from hermes_timeline_code_map.store import TimelineCodeMap, _code_index_health
 
 
@@ -637,6 +638,88 @@ class TimelineCodeMapTests(unittest.TestCase):
         self.assertNotIn(node_id, {item["id"] for item in recalled["items"]})
         self.assertIsNotNone(self.store.get_node(node_id))
 
+    def test_freshness_classification_preserves_market_policy_and_reports(self) -> None:
+        policy_id = self.store.record(
+            domain="timeline",
+            kind="policy",
+            title="Hermes market pulse policy",
+            body={"policy": "market pulse evidence is recorded for later audits"},
+        )
+        report_id = self.store.record(
+            domain="market",
+            kind="report",
+            title="Daily market report",
+            body={"as_of": "2026-07-21", "conclusion": "risk-off"},
+        )
+        quote_id = self.store.record(
+            domain="market",
+            kind="quote",
+            title="VIX intraday quote",
+            body={"quote": 18.56},
+        )
+        explicit_id = self.store.record(
+            domain="market",
+            kind="quote",
+            title="Reusable market regime lesson",
+            body={
+                "memory_descriptor": {"temporal_scope": "durable"},
+                "lesson": "VIX and yields can rise together",
+            },
+        )
+
+        conn = sqlite3.connect(self.db_path)
+        try:
+            by_id = {
+                row[0]: (row[1], row[2])
+                for row in conn.execute(
+                    "SELECT node_id, freshness_class, expires_at FROM neural_node_features"
+                )
+            }
+        finally:
+            conn.close()
+
+        self.assertEqual(by_id[policy_id], ("durable", None))
+        self.assertEqual(by_id[report_id], ("episodic", None))
+        self.assertEqual(by_id[quote_id][0], "market_live")
+        self.assertIsNotNone(by_id[quote_id][1])
+        self.assertEqual(by_id[explicit_id], ("durable", None))
+        status = self.store.neural_link_status()
+        self.assertEqual(status["freshness"]["durable"]["total"], 2)
+        self.assertEqual(status["freshness"]["episodic"]["total"], 1)
+        self.assertEqual(status["freshness"]["market_live"]["total"], 1)
+
+    def test_historical_recall_can_return_expired_evidence_with_stale_label(self) -> None:
+        node_id = self.store.record(
+            domain="market",
+            kind="quote",
+            title="VIX historical spike quote",
+            body={"symbol": "VIX", "quote": 31.25},
+        )
+        conn = sqlite3.connect(self.db_path)
+        try:
+            conn.execute(
+                "UPDATE neural_node_features SET expires_at='2000-01-01T00:00:00.000Z' WHERE node_id=?",
+                (node_id,),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+        current = self.store.recall_neural_context("VIX historical spike quote")
+        historical = self.store.recall_neural_context("예전에 VIX historical spike quote 기록")
+        forced_current = self.store.recall_neural_context(
+            "예전에 VIX historical spike quote 기록", include_expired=False
+        )
+
+        self.assertNotIn(node_id, {item["id"] for item in current["items"]})
+        self.assertIn(node_id, {item["id"] for item in historical["items"]})
+        item = next(item for item in historical["items"] if item["id"] == node_id)
+        self.assertEqual(item["freshness_status"], "expired")
+        self.assertTrue(historical["historical_recall"])
+        self.assertTrue(historical["include_expired"])
+        self.assertIn("STALE/EXPIRED", historical["context"])
+        self.assertNotIn(node_id, {item["id"] for item in forced_current["items"]})
+
     def test_neural_recall_uses_short_query_coverage_against_long_reports(self) -> None:
         node_id = self.store.record(
             domain="timeline",
@@ -744,6 +827,52 @@ class TimelineCodeMapTests(unittest.TestCase):
             conn.close()
         self.assertEqual(self.store.neural_link_status()["pending_nodes"], 1)
         result = self.store.backfill_neural_links(batch_size=1)
+        self.assertEqual(result["refreshed"], 1)
+        self.assertEqual(result["pending_nodes"], 0)
+
+    def test_neural_backfill_reclassifies_old_market_keyword_false_positive(self) -> None:
+        node_id = self.store.record(
+            domain="timeline",
+            kind="policy",
+            title="Timeline market policy",
+            body={"policy": "market pulse data supports durable audit history"},
+        )
+        conn = sqlite3.connect(self.db_path)
+        try:
+            conn.execute(
+                "UPDATE neural_node_features SET freshness_class='market_live', "
+                "expires_at='2000-01-01T00:00:00.000Z' WHERE node_id=?",
+                (node_id,),
+            )
+            conn.execute(
+                "DELETE FROM neural_feature_terms WHERE node_id=? AND term_type='meta'",
+                (node_id,),
+            )
+            conn.execute(
+                "INSERT INTO neural_feature_terms (node_id, term_type, term) VALUES (?,?,?)",
+                (node_id, "meta", "feature:v4-semantic-capsule"),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+        self.assertEqual(self.store.neural_link_status()["pending_nodes"], 1)
+        result = self.store.backfill_neural_links(batch_size=1)
+
+        conn = sqlite3.connect(self.db_path)
+        try:
+            feature = conn.execute(
+                "SELECT freshness_class, expires_at FROM neural_node_features WHERE node_id=?",
+                (node_id,),
+            ).fetchone()
+            marker = conn.execute(
+                "SELECT 1 FROM neural_feature_terms WHERE node_id=? AND term_type='meta' AND term=?",
+                (node_id, FEATURE_VERSION_MARKER),
+            ).fetchone()
+        finally:
+            conn.close()
+        self.assertEqual(feature, ("durable", None))
+        self.assertIsNotNone(marker)
         self.assertEqual(result["refreshed"], 1)
         self.assertEqual(result["pending_nodes"], 0)
 

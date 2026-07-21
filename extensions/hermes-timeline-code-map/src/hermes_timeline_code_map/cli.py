@@ -125,8 +125,12 @@ def build_parser() -> argparse.ArgumentParser:
     recall.add_argument("query")
     recall.add_argument("--limit", type=int, default=8)
     recall.add_argument("--max-chars", type=int, default=2600)
-    recall.add_argument("--max-depth", type=int, default=2)
+    recall.add_argument("--max-depth", type=int, default=0, help="0 lets historical cues choose the depth")
     recall.add_argument("--candidate-mode", action="store_true")
+    expiry = recall.add_mutually_exclusive_group()
+    expiry.add_argument("--include-expired", dest="include_expired", action="store_true")
+    expiry.add_argument("--exclude-expired", dest="include_expired", action="store_false")
+    recall.set_defaults(include_expired=None)
     subparsers.add_parser("neural-status", help="Show incremental NeuralLink index status.")
 
     return parser
@@ -203,8 +207,9 @@ def main(argv: list[str] | None = None) -> int:
                     args.query,
                     limit=args.limit,
                     max_chars=args.max_chars,
-                    max_depth=args.max_depth,
+                    max_depth=args.max_depth or None,
                     candidate_mode=args.candidate_mode,
+                    include_expired=args.include_expired,
                 ),
                 ensure_ascii=False,
                 indent=2,

@@ -116,14 +116,16 @@ def create_server(db_path: str | None = None):
         max_chars: int = 1800,
         max_depth: int = 0,
         candidate_mode: bool = False,
+        include_expired: bool | None = None,
     ) -> dict:
-        """요청 단서와 AI가 만든 유사어/개념 probe에서 다단계 기억 후보를 조회한다. candidate_mode는 최종 판단을 하지 않고 넓은 후보를 반환한다."""
+        """다단계 기억 후보를 조회한다. 과거 회상 단서는 만료 후보를 STALE/EXPIRED로 표시한다."""
         return store.recall_neural_context(
             query,
             limit=limit,
             max_chars=max_chars,
             max_depth=max_depth or None,
             candidate_mode=candidate_mode,
+            include_expired=include_expired,
         )
 
     @mcp.tool()

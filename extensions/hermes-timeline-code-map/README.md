@@ -83,6 +83,36 @@ solve semantic memory completely. It removes an embedding-service dependency,
 but abstract similarity still depends on generated aliases, metadata, graph
 links, and final model reranking.
 
+### Temporal retention and historical recall
+
+Timeline evidence nodes are not deleted by NeuralLink expiry. Expiry only
+controls default recall visibility:
+
+- live quotes, bars, order books, and intraday snapshots use `market_live`
+  with a one-day default TTL;
+- service health, probes, heartbeats, and runtime status use `runtime_state`
+  with a seven-day default TTL;
+- reports, analyses, completed actions, and reviews use non-expiring
+  `episodic` retention;
+- policy, contracts, decisions, architecture, playbooks, runbooks, and know-how
+  use non-expiring `durable` retention.
+
+`memory_descriptor.temporal_scope` or
+`memory_descriptor.freshness_class` overrides heuristic classification. Valid
+classes are `market_live`, `runtime_state`, `episodic`, and `durable`; optional
+`ttl_days` or `expires_at` can narrow an expiring class.
+
+Explicit historical cues such as `before`, `earlier`, `history`, `remember`,
+`전에`, `예전`, or `과거` deepen graph traversal and may include expired nodes.
+Those candidates are always labelled `STALE/EXPIRED` and must be revalidated
+before they are used as current facts. Operators can force either behavior with
+the MCP `include_expired` argument or the CLI `--include-expired` and
+`--exclude-expired` switches.
+
+After upgrading from an older feature version, run
+`backfill_neural_links_tool` or the equivalent store backfill once. Versioned
+features are reclassified in place without deleting their Timeline nodes.
+
 ## Tests
 
 ```bash

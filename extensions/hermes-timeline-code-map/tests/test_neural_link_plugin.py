@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.util
 import os
+import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
@@ -69,6 +70,41 @@ class TimelineNeuralLinkPluginTests(unittest.TestCase):
             else:
                 os.environ["TIMELINE_CODE_MAP_DB_PATH"] = original
         self.assertIsNone(result)
+
+    def test_hook_labels_expired_evidence_for_explicit_historical_recall(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "graph.db"
+            store = TimelineCodeMap(str(db_path))
+            node_id = store.record(
+                domain="market",
+                kind="quote",
+                title="VIX historical spike quote",
+                body={"symbol": "VIX", "quote": 31.25},
+            )
+            with sqlite3.connect(db_path) as conn:
+                conn.execute(
+                    "UPDATE neural_node_features SET expires_at='2000-01-01T00:00:00.000Z' "
+                    "WHERE node_id=?",
+                    (node_id,),
+                )
+
+            before = db_path.stat().st_mtime_ns
+            original = os.environ.get("TIMELINE_CODE_MAP_DB_PATH")
+            os.environ["TIMELINE_CODE_MAP_DB_PATH"] = str(db_path)
+            try:
+                result = _load_plugin().on_pre_llm_call(
+                    user_message="예전에 VIX historical spike quote가 얼마였지?"
+                )
+            finally:
+                if original is None:
+                    os.environ.pop("TIMELINE_CODE_MAP_DB_PATH", None)
+                else:
+                    os.environ["TIMELINE_CODE_MAP_DB_PATH"] = original
+
+            self.assertIsNotNone(result)
+            self.assertIn("VIX historical spike quote", result["context"])
+            self.assertIn("STALE/EXPIRED", result["context"])
+            self.assertEqual(before, db_path.stat().st_mtime_ns)
 
 
 if __name__ == "__main__":

@@ -1117,6 +1117,7 @@ class TimelineCodeMap:
         max_chars: int = 1800,
         max_depth: int | None = None,
         candidate_mode: bool = False,
+        include_expired: bool | None = None,
     ) -> dict:
         with _connect(self.db_path) as conn:
             return recall_query(
@@ -1126,6 +1127,7 @@ class TimelineCodeMap:
                 max_chars=max_chars,
                 max_depth=max_depth,
                 candidate_mode=candidate_mode,
+                include_expired=include_expired,
             )
 
     def neural_link_status(self) -> dict:
@@ -1141,6 +1143,20 @@ class TimelineCodeMap:
                     "SELECT count(DISTINCT node_id) FROM neural_feature_terms WHERE term_type='meta' AND term=?",
                     (FEATURE_VERSION_MARKER,),
                 ).fetchone()[0],
+            }
+            freshness_rows = conn.execute(
+                """
+                SELECT freshness_class, count(*) AS total,
+                       sum(CASE WHEN expires_at IS NOT NULL AND julianday(expires_at) < julianday('now')
+                                THEN 1 ELSE 0 END) AS expired
+                FROM neural_node_features
+                GROUP BY freshness_class
+                ORDER BY freshness_class
+                """
+            ).fetchall()
+            counts["freshness"] = {
+                row["freshness_class"]: {"total": row["total"], "expired": row["expired"]}
+                for row in freshness_rows
             }
             counts["pending_nodes"] = counts["nodes"] - counts["current_feature_nodes"]
             return counts

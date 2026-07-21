@@ -1,0 +1,13 @@
+{
+  "schema": "hermes.external-adapter.v1",
+  "id": "executor_example_cli",
+  "name": "Example command adapter",
+  "description": "Copy this file and replace the executable and argv contract.",
+  "executable": "example-agent",
+  "engine_argv": ["{binary}", "run", "--prompt-file", "{prompt_file}"],
+  "probe_argv": ["{binary}", "--version"],
+  "capabilities": ["file", "terminal", "kanban", "hermes-timeline-code-map"],
+  "shell_keys": ["code", "operations", "report", "verification"],
+  "capacity": 1,
+  "priority": 50
+}

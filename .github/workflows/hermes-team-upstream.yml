@@ -1,0 +1,43 @@
+name: HERMES-TEAM upstream compatibility
+
+# Intended timezone: Asia/Seoul (KST)
+# Intended local time: Tuesday 03:17 KST
+# Stored/scheduler timezone: UTC
+# Stored cron: Monday 18:17 UTC
+# Reporting timezone: KST
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 18 * * 1"
+
+permissions:
+  contents: read
+
+jobs:
+  merge-preflight:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Check latest upstream merge compatibility
+        id: preflight
+        continue-on-error: true
+        run: |
+          python3 scripts/check_hermes_team_upgrade.py \
+            --fetch \
+            --upstream-ref hermes-team-upstream/main \
+            --json-out artifacts/upgrade-preflight.json
+      - name: Upload compatibility report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: hermes-team-upgrade-preflight
+          path: artifacts/upgrade-preflight.json
+      - name: Enforce compatibility gate
+        if: steps.preflight.outcome != 'success'
+        run: exit 1

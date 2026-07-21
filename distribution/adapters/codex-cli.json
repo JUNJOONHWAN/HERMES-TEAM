@@ -1,0 +1,18 @@
+{
+  "schema": "hermes.external-adapter.v1",
+  "id": "executor_codex_cli",
+  "name": "Codex CLI adapter",
+  "description": "Optional Codex worker. Authentication remains in the operator's Codex installation.",
+  "executable": "codex",
+  "engine_argv": [
+    "{binary}",
+    "exec",
+    "--skip-git-repo-check",
+    "{prompt_text}"
+  ],
+  "probe_argv": ["{binary}", "--version"],
+  "capabilities": ["file", "terminal", "kanban", "hermes-timeline-code-map"],
+  "shell_keys": ["code", "operations", "report", "verification"],
+  "capacity": 2,
+  "priority": 80
+}

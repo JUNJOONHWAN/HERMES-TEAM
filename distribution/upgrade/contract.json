@@ -1,0 +1,24 @@
+{
+  "schema": "hermes-team.upgrade-contract.v1",
+  "project": "HERMES-TEAM",
+  "upstream": {
+    "url": "https://github.com/NousResearch/hermes-agent.git",
+    "branch": "main",
+    "baseline_commit": "5445e42b87b9918d5b1bfa9f4eadd8e4bb10ff37"
+  },
+  "preserved_upstream_identities": [
+    "hermes-agent Python distribution",
+    "hermes CLI command",
+    "hermes and hermes_cli Python packages",
+    "~/.hermes runtime root",
+    "~/.hermes/hermes-agent installation layout"
+  ],
+  "validation_command": "scripts/run_tests.sh -j 8 --exclude-manifest distribution/validation/test_exclusions.json",
+  "policy": {
+    "merge_strategy": "three-way upstream merge",
+    "silent_overwrite": false,
+    "stale_test_exclusions": "fail",
+    "merge_conflicts": "fail_and_report",
+    "post_merge_full_validation": "required"
+  }
+}

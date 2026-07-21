@@ -1,0 +1,29 @@
+{
+  "schema": "hermes.test-exclusions.v1",
+  "project": "HERMES-TEAM",
+  "baseline_upstream_commit": "5445e42b87b9918d5b1bfa9f4eadd8e4bb10ff37",
+  "file_globs": [
+    {
+      "pattern": "tests/acp/test_*.py",
+      "reason": "The optional agent-client-protocol dependency is outside the HERMES-TEAM public core installation."
+    },
+    {
+      "pattern": "tests/acp_adapter/test_*.py",
+      "reason": "The optional ACP adapter extra is outside the HERMES-TEAM public core installation."
+    }
+  ],
+  "nodeids": [
+    {
+      "nodeid": "tests/agent/test_anthropic_adapter.py::TestRunOauthSetupToken::test_returns_token_from_credential_files",
+      "reason": "Upstream baseline test globally mocks subprocess.run, causing the macOS keychain reader to receive MagicMock stdout."
+    },
+    {
+      "nodeid": "tests/agent/test_anthropic_adapter.py::TestRunOauthSetupToken::test_returns_token_from_env_var",
+      "reason": "Upstream baseline test globally mocks subprocess.run, causing the macOS keychain reader to receive MagicMock stdout."
+    },
+    {
+      "nodeid": "tests/agent/test_anthropic_adapter.py::TestRunOauthSetupToken::test_returns_none_when_no_creds_found",
+      "reason": "Upstream baseline test globally mocks subprocess.run, causing the macOS keychain reader to receive MagicMock stdout."
+    }
+  ]
+}

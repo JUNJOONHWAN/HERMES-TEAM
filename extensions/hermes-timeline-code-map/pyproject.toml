@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "hermes-timeline-code-map"
+version = "0.1.0"
+description = "Shared timeline, code, output, and reasoning graph for Hermes, Claude, and Codex CLI."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = []
+
+[project.optional-dependencies]
+mcp = ["mcp>=1.10.0"]
+
+[project.scripts]
+hermes-timeline-cli = "hermes_timeline_code_map.cli:main"
+hermes-timeline-mcp = "hermes_timeline_code_map.mcp_server:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]

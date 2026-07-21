@@ -1,0 +1,6 @@
+name: timeline-neural-link
+version: "0.1.0"
+description: "Injects bounded, read-only multi-hop Timeline associative memory before each Hermes LLM turn."
+author: HERMES-TEAM
+hooks:
+  - pre_llm_call

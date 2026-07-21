@@ -15,7 +15,7 @@ MAX_FEATURE_ENTITIES = 24
 MAX_FEATURE_WORKFLOWS = 12
 DEFAULT_CANDIDATE_LIMIT = 24
 DEFAULT_LINK_LIMIT = 4
-FEATURE_VERSION_MARKER = "feature:v5-temporal-scope"
+FEATURE_VERSION_MARKER = "feature:v6-temporal-scope"
 
 NEURAL_SCHEMA = """
 CREATE TABLE IF NOT EXISTS neural_node_features (
@@ -96,12 +96,15 @@ _TEMPORAL_SCOPE_ALIASES = {
 _DURABLE_DOMAINS = {"memory", "policy", "architecture", "projects", "code", "reasoning", "documentation"}
 _DURABLE_KINDS = {
     "architecture", "conclusion", "contract", "decision", "knowhow", "playbook",
-    "policy", "preference", "procedure", "repository", "runbook", "symbol",
+    "knowledge", "knowledge_update", "knowhow_update", "policy", "preference",
+    "procedure", "repository", "runbook", "symbol",
 }
 _EPISODIC_KINDS = {
-    "action", "analysis", "checkpoint", "diagnosis", "implementation", "lesson",
-    "output", "post_impact_report", "pre_impact_report", "report", "research",
-    "review", "summary", "verification",
+    "action", "analysis", "audit", "checkpoint", "daily_review", "diagnosis",
+    "diagnostic", "finding", "impact_report", "implementation", "incident",
+    "investigation", "judgment", "lesson", "output", "post_impact_report",
+    "pre_impact_report", "reasoning", "report", "research", "review", "summary",
+    "verification",
 }
 _MARKET_LIVE_KINDS = {"bar", "intraday", "market_pulse", "orderbook", "price", "quote", "snapshot", "tick"}
 _RUNTIME_STATE_KINDS = {"heartbeat", "health", "probe", "status"}

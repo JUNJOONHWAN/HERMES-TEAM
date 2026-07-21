@@ -666,6 +666,36 @@ class TimelineCodeMapTests(unittest.TestCase):
                 "lesson": "VIX and yields can rise together",
             },
         )
+        knowledge_id = self.store.record(
+            domain="stock-research-knowhow",
+            kind="knowledge_update",
+            title="Preserve reusable market investigation method",
+            body={"knowhow": "Check source provenance before comparing market snapshots"},
+        )
+        impact_id = self.store.record(
+            domain="hermes-market-worker-runtime",
+            kind="impact_report",
+            title="Market worker pre-change impact report",
+            body={"as_of": "2026-07-21", "impact": "No live quote mutation"},
+        )
+        judgment_id = self.store.record(
+            domain="market-data-operations",
+            kind="judgment",
+            title="Market data entitlement diagnosis",
+            body={"conclusion": "Provider route needs correction"},
+        )
+        reasoning_id = self.store.record(
+            domain="market-verification",
+            kind="reasoning",
+            title="Correction evidence synthesis",
+            body={"conclusion": "Historical evidence supports the repair"},
+        )
+        evidence_id = self.store.record(
+            domain="market",
+            kind="evidence",
+            title="Topstep futures snapshot",
+            body={"as_of": "2026-07-21T14:30:00Z", "symbol": "NQ"},
+        )
 
         conn = sqlite3.connect(self.db_path)
         try:
@@ -683,10 +713,16 @@ class TimelineCodeMapTests(unittest.TestCase):
         self.assertEqual(by_id[quote_id][0], "market_live")
         self.assertIsNotNone(by_id[quote_id][1])
         self.assertEqual(by_id[explicit_id], ("durable", None))
+        self.assertEqual(by_id[knowledge_id], ("durable", None))
+        self.assertEqual(by_id[impact_id], ("episodic", None))
+        self.assertEqual(by_id[judgment_id], ("episodic", None))
+        self.assertEqual(by_id[reasoning_id], ("episodic", None))
+        self.assertEqual(by_id[evidence_id][0], "market_live")
+        self.assertIsNotNone(by_id[evidence_id][1])
         status = self.store.neural_link_status()
-        self.assertEqual(status["freshness"]["durable"]["total"], 2)
-        self.assertEqual(status["freshness"]["episodic"]["total"], 1)
-        self.assertEqual(status["freshness"]["market_live"]["total"], 1)
+        self.assertEqual(status["freshness"]["durable"]["total"], 3)
+        self.assertEqual(status["freshness"]["episodic"]["total"], 4)
+        self.assertEqual(status["freshness"]["market_live"]["total"], 2)
 
     def test_historical_recall_can_return_expired_evidence_with_stale_label(self) -> None:
         node_id = self.store.record(

@@ -114,7 +114,7 @@ CREATE TABLE IF NOT EXISTS project_progress (
     updated_at             INTEGER NOT NULL
 );
 
--- A code card proposal is not a Kanban card until the operator approves it.
+-- A governed card proposal is not a Kanban card until the operator approves it.
 -- request_json is the complete immutable creation payload, so approval works
 -- identically from Telegram and the web dashboard after a process restart.
 CREATE TABLE IF NOT EXISTS project_card_approvals (
@@ -840,7 +840,7 @@ def create_card_approval(
     source_card_id: Optional[str] = None,
     requested_by: Optional[str] = None,
 ) -> dict:
-    """Persist an idempotent operator approval request for a future code card."""
+    """Persist an idempotent operator approval request for a future card."""
     if get_project(conn, project_id) is None:
         raise ValueError(f"no such project: {project_id}")
     key = str(dedupe_key or "").strip()

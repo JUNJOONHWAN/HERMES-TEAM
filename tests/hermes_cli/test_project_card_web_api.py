@@ -96,6 +96,37 @@ def test_web_api_uses_same_native_project_card_controller(
     independent_card = independent.json()["card"]
     assert independent_card["root_task_id"] == independent_card["id"]
 
+    redirected = project_api_client.post(
+        f"/api/plugins/kanban/cards/{independent_card['id']}/direction-change",
+        json={
+            "title": "Replace the independent stream direction",
+            "reason": "The acceptance criteria changed",
+            "shell_key": "code",
+            "acceptance_criteria": ["Replacement is independently verified"],
+        },
+    )
+    assert redirected.status_code == 200, redirected.text
+    redirected_body = redirected.json()
+    assert redirected_body["source_status"] == "archived"
+    assert redirected_body["successor_card"] is None
+    direction_approval = redirected_body["approval_request"]["id"]
+    direction_approved = project_api_client.post(
+        f"/api/plugins/kanban/projects/approvals/{direction_approval}/approve",
+        json={"decided_by": "web-test"},
+    )
+    assert direction_approved.status_code == 200, direction_approved.text
+    direction_id = direction_approved.json()["card"]["id"]
+    direction_inspected = project_api_client.get(
+        f"/api/plugins/kanban/cards/{direction_id}/inspect"
+    ).json()
+    assert direction_inspected["links"]["incoming"] == [
+        {
+            "task_id": independent_card["id"],
+            "relation_type": "references",
+            "blocking": False,
+        }
+    ]
+
     follow = project_api_client.post(
         f"/api/plugins/kanban/cards/{root_id}/continue",
         json={"title": "Add an intuitive follow-up action"},
@@ -165,7 +196,10 @@ def test_web_bundle_exposes_independent_root_card_action():
 
     assert "/projects/${encodeURIComponent(projectId)}/cards" in bundle
     assert "/projects/approvals/${encodeURIComponent(approvalId)}/${action}" in bundle
-    assert "Approve code card" in bundle
+    assert "/cards/${encodeURIComponent(props.taskId)}/${action}" in bundle
+    assert 'invoke("direction-change"' in bundle
+    assert "Change direction" in bundle
+    assert "Approve card" in bundle
     assert "Repository setup: none, existing, init_local, or github" in bundle
     assert "+ New root card" in bundle
     assert 'changeStatus("pause")' in bundle

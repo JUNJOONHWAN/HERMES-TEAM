@@ -1450,6 +1450,26 @@ def _handle_project_cards(args: dict[str, Any], **_kwargs) -> str:
                 milestone=(str(args.get("milestone") or "").strip() or None),
                 **common,
             )
+        elif action == "request_direction_change":
+            result = project_cards.request_direction_change(
+                str(args.get("card_id") or ""),
+                title=str(args.get("title") or ""),
+                reason=str(args.get("reason") or ""),
+                body=(str(args.get("body") or "").strip() or None),
+                shell_key=(str(args.get("shell_key") or "").strip() or None),
+                acceptance_criteria=args.get("acceptance_criteria"),
+                input_refs=args.get("input_refs"),
+                workspace_kind=(
+                    str(args.get("workspace_kind") or "").strip() or None
+                ),
+                workspace_path=(
+                    str(args.get("workspace_path") or "").strip() or None
+                ),
+                priority=int(args.get("priority") or 0),
+                executor_id=(str(args.get("executor_id") or "").strip() or None),
+                milestone=(str(args.get("milestone") or "").strip() or None),
+                **common,
+            )
         elif action == "split_card":
             result = project_cards.split_card(
                 str(args.get("card_id") or ""),
@@ -1492,8 +1512,20 @@ def _handle_project_cards(args: dict[str, Any], **_kwargs) -> str:
                 decided_by="telegram-operator" if session_id else "operator",
                 decision_reason=(str(args.get("reason") or "").strip() or None),
             )
+        elif action == "approve_project_card":
+            result = project_cards.approve_project_card(
+                str(args.get("approval_id") or ""),
+                decided_by="telegram-operator" if session_id else "operator",
+                decision_reason=(str(args.get("reason") or "").strip() or None),
+            )
         elif action == "reject_code_card":
             result = project_cards.reject_code_card(
+                str(args.get("approval_id") or ""),
+                decided_by="telegram-operator" if session_id else "operator",
+                decision_reason=(str(args.get("reason") or "").strip() or None),
+            )
+        elif action == "reject_project_card":
+            result = project_cards.reject_project_card(
                 str(args.get("approval_id") or ""),
                 decided_by="telegram-operator" if session_id else "operator",
                 decision_reason=(str(args.get("reason") or "").strip() or None),
@@ -2021,12 +2053,14 @@ SUPERVISOR_PROJECT_SCHEMA = {
         "Native deterministic Project/Card Controller. Use it for long-lived "
         "team projects and card chains: start a project, add an independent "
         "root card inside it, continue a completed or active card with a "
-        "follow-up, split work into parallel role cards, "
+        "follow-up, stop/checkpoint a card and request an approved direction-change "
+        "successor, split work into parallel role cards, "
         "create an independent verification card, recover failed work through "
         "another compatible adapter, inspect/locate old cards, configure a "
         "local or GitHub repository, checkpoint/push card branches, approve or "
-        "reject proposed code cards, or pause/close/reopen a project. New code cards "
-        "are proposals until an operator explicitly approves their pa_* id. "
+        "reject proposed cards, or pause/close/reopen a project. New code cards and "
+        "all direction-change successors are proposals until an operator explicitly "
+        "approves their pa_* id. "
         "This is controller authority, not a worker adapter: workers "
         "execute the resulting immutable Role Shell cards and cannot mutate the "
         "project graph themselves. Completed cards stay immutable."
@@ -2041,6 +2075,7 @@ SUPERVISOR_PROJECT_SCHEMA = {
                     "start_project",
                     "add_project_card",
                     "continue_card",
+                    "request_direction_change",
                     "split_card",
                     "verify_card",
                     "recover_card",
@@ -2051,6 +2086,8 @@ SUPERVISOR_PROJECT_SCHEMA = {
                     "pause_project",
                     "reopen_project",
                     "list_code_card_approvals",
+                    "approve_project_card",
+                    "reject_project_card",
                     "approve_code_card",
                     "reject_code_card",
                     "configure_repository",

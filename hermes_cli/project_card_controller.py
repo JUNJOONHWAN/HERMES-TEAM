@@ -334,16 +334,21 @@ def _request_code_card(payload: dict[str, Any]) -> dict:
             requested_by=payload.get("created_by"),
         )
         # A proposal is a real control-plane stop, not just a UI label.  Once a
-        # code-card proposal exists every card-writing controller action is
+        # governed card proposal exists every card-writing controller action is
         # rejected until an operator approves/rejects and resumes the Project.
         pdb.set_project_status(conn, payload["project_id"], "paused")
         current = pdb.get_project_progress(conn, payload["project_id"]) or {}
+        phase = (
+            "awaiting_direction_change_approval"
+            if payload.get("action") == "direction_change"
+            else "awaiting_code_approval"
+        )
         pdb.upsert_project_progress(
             conn,
             payload["project_id"],
-            phase="awaiting_code_approval",
+            phase=phase,
             milestone=payload.get("milestone") or current.get("milestone"),
-            summary=f"Code card approval pending: {approval['id']}",
+            summary=f"Project card approval pending: {approval['id']}",
             next_action=f"Approve or reject {approval['id']}",
             last_card_id=current.get("last_card_id"),
             last_verified_card_id=current.get("last_verified_card_id"),
@@ -615,6 +620,214 @@ def continue_card(
         approval=approval,
         source_card_id=source.id,
     )
+
+
+def request_direction_change(
+    card_id: str,
+    *,
+    title: str,
+    reason: str,
+    body: Optional[str] = None,
+    shell_key: Optional[str] = None,
+    acceptance_criteria: Optional[Iterable[Any]] = None,
+    input_refs: Optional[Iterable[Any]] = None,
+    workspace_kind: Optional[str] = None,
+    workspace_path: Optional[str] = None,
+    priority: int = 0,
+    executor_id: Optional[str] = None,
+    session_id: Optional[str] = None,
+    created_by: str = "project-card-controller",
+    milestone: Optional[str] = None,
+) -> dict[str, Any]:
+    """Stop one card and stage an operator-approved successor.
+
+    This is deliberately not live prompt injection.  The source card is first
+    archived, which closes its run and terminates any host-local worker.  Its
+    Git workspace is then checkpointed when possible.  Only after that durable
+    stop is a successor *proposal* persisted; no successor Kanban card exists
+    until the operator consumes the ``pa_*`` approval.
+
+    The archived source remains the immutable audit/checkpoint anchor.  The
+    successor uses a non-blocking ``references`` link because a superseded card
+    is not expected to complete and must not hold the new direction in ``todo``.
+    """
+    successor_title = str(title or "").strip()
+    if not successor_title:
+        raise ProjectCardControllerError("successor card title is required")
+    direction_reason = str(reason or "").strip()
+    if not direction_reason:
+        raise ProjectCardControllerError("direction change reason is required")
+
+    located = locate_card(card_id)
+    board = located["board"]
+    source: kb.Task = located["task"]
+    if not source.project_id:
+        raise ProjectCardControllerError(
+            f"card {source.id} is not attached to a Project"
+        )
+    if source.status == "done":
+        raise ProjectCardControllerError(
+            f"card {source.id} is done; use continue_card for follow-up work"
+        )
+    project = _project(source.project_id, include_completed=False)
+
+    successor_body = (
+        f"Direction change from card {source.id}.\n"
+        f"Reason: {direction_reason}"
+    )
+    if body and str(body).strip():
+        successor_body += "\n\n" + str(body).strip()
+
+    # Validate the complete successor proposal before stopping live work.  A
+    # typo in a Role Shell or workspace must never cancel a healthy worker.
+    with kb.connect_closing(board=board) as conn:
+        registry.ensure_schema(conn)
+        key = shell_key or _source_shell_key(conn, source)
+        resolved_shell = _resolve_shell(conn, key)
+        resolved_kind, resolved_path = _workspace_for_card(
+            project=project,
+            shell_key=resolved_shell.shell_key,
+            workspace_kind=workspace_kind,
+            workspace_path=workspace_path,
+        )
+        payload = _approval_payload(
+            action="direction_change",
+            project=project,
+            title=successor_title,
+            body=successor_body,
+            shell_key=resolved_shell.shell_key,
+            source_task=source,
+            relation_type="references",
+            acceptance_criteria=acceptance_criteria,
+            input_refs=input_refs,
+            workspace_kind=resolved_kind,
+            workspace_path=resolved_path,
+            priority=priority,
+            executor_id=executor_id,
+            session_id=session_id,
+            created_by=created_by,
+            milestone=milestone,
+        )
+        source_status_before = source.status
+        workspace = kb.resolve_workspace(source, board=board)
+        git_root = kb._repo_root_for_worktree_target(workspace)
+        # Close the project-level issue gate before touching the worker.  This
+        # prevents a concurrent controller request from issuing another card
+        # during the stop/checkpoint window.  A checkpoint failure deliberately
+        # leaves the Project paused for operator repair.
+        with pdb.connect_closing() as project_conn:
+            pdb.set_project_status(project_conn, project.id, "paused")
+            current = pdb.get_project_progress(project_conn, project.id) or {}
+            pdb.upsert_project_progress(
+                project_conn,
+                project.id,
+                phase="direction_change_checkpointing",
+                milestone=milestone or current.get("milestone"),
+                summary=f"Stopping and checkpointing card {source.id}",
+                next_action="Wait for checkpoint or repair a checkpoint failure",
+                last_card_id=current.get("last_card_id"),
+                last_verified_card_id=current.get("last_verified_card_id"),
+                counts=current.get("counts") or {},
+            )
+        if source.status != "archived" and not kb.archive_task(conn, source.id):
+            raise ProjectCardControllerError(
+                f"card {source.id} could not be stopped for direction change"
+            )
+        stopped = kb.get_task(conn, source.id)
+        if stopped is None:
+            raise ProjectCardControllerError(
+                f"card {source.id} disappeared while stopping direction change"
+            )
+        if stopped.worker_pid is not None:
+            kb.add_comment(
+                conn,
+                source.id,
+                created_by,
+                "Direction change archived this card, but worker termination "
+                f"is still pending for PID {stopped.worker_pid}. The Project "
+                "remains paused; no checkpoint or successor approval was created.",
+            )
+            raise ProjectCardControllerError(
+                f"card {source.id} is archived but worker termination is still "
+                "pending; no checkpoint or successor approval was created"
+            )
+
+    checkpoint: dict[str, Any]
+    if git_root is None:
+        checkpoint = {
+            "status": "not_applicable",
+            "reason": "card workspace is not inside a Git repository",
+            "workspace": str(workspace),
+        }
+    else:
+        try:
+            checkpoint = checkpoint_card_git(
+                source.id,
+                message=(
+                    f"{project.slug}: {source.id} direction-change checkpoint"
+                ),
+                push=False,
+            )
+            checkpoint["status"] = "committed"
+        except Exception as exc:
+            with kb.connect_closing(board=board) as conn:
+                kb.add_comment(
+                    conn,
+                    source.id,
+                    created_by,
+                    "Direction change stopped this card, but the Git checkpoint "
+                    f"failed: {exc}. Fix the checkpoint and request the successor "
+                    "again; no successor approval was created.",
+                )
+            raise ProjectCardControllerError(
+                "source card was stopped and preserved, but Git checkpoint failed; "
+                "no successor approval was created: " + str(exc)
+            ) from exc
+
+    payload["direction_change"] = {
+        "reason": direction_reason,
+        "source_status_before": source_status_before,
+        "source_status_after": "archived",
+        "checkpoint": {
+            key: checkpoint.get(key)
+            for key in ("status", "workspace", "branch", "sha", "pushed", "reason")
+            if checkpoint.get(key) is not None
+        },
+    }
+    approval = _request_code_card(payload)
+    with kb.connect_closing(board=board) as conn:
+        kb.add_comment(
+            conn,
+            source.id,
+            created_by,
+            "\n".join(
+                [
+                    "Direction change checkpointed; original card preserved as archived.",
+                    f"Project: {project.id}",
+                    f"Source card: {source.id}",
+                    f"Successor draft: {successor_title}",
+                    f"Reason: {direction_reason}",
+                    f"Approval required: {approval['id']}",
+                    f"Checkpoint: {checkpoint.get('status')}",
+                ]
+            ),
+        )
+    progress = sync_project_progress(project.id, milestone=milestone)
+    current_project = _project(project.id, include_completed=True)
+    return {
+        "schema": SCHEMA,
+        "action": "request_direction_change",
+        "project": current_project.to_dict(),
+        "project_id": project.id,
+        "board": board,
+        "source_card_id": source.id,
+        "source_status": "archived",
+        "successor_card": None,
+        "approval_required": True,
+        "approval_request": approval,
+        "checkpoint": checkpoint,
+        "progress": progress,
+    }
 
 
 def add_project_card(
@@ -948,6 +1161,14 @@ def approve_code_card(
                     raise ProjectCardControllerError(
                         f"approval source card belongs to another project: {source_id}"
                     )
+            requested_shell = str(
+                payload.get("shell_key") or approval.get("shell_key") or "code"
+            ).strip()
+            if payload.get("action") == "direction_change" and source is not None:
+                if source.status != "archived":
+                    raise ProjectCardControllerError(
+                        "direction-change source must remain archived until approval"
+                    )
             card = _create_card(
                 conn=conn,
                 project=project,
@@ -955,7 +1176,7 @@ def approve_code_card(
                 relation_type=str(payload.get("relation_type") or "depends_on"),
                 title=str(payload.get("title") or approval["title"]),
                 body=payload.get("body"),
-                shell_key="code",
+                shell_key=requested_shell,
                 acceptance_criteria=payload.get("acceptance_criteria"),
                 input_refs=payload.get("input_refs"),
                 workspace_kind=payload.get("workspace_kind"),
@@ -1054,6 +1275,38 @@ def reject_code_card(
     }
 
 
+def approve_project_card(
+    approval_id: str,
+    *,
+    decided_by: str = "operator",
+    decision_reason: Optional[str] = None,
+) -> dict[str, Any]:
+    """Approve any governed card proposal; code-card name remains compatible."""
+    result = approve_code_card(
+        approval_id,
+        decided_by=decided_by,
+        decision_reason=decision_reason,
+    )
+    result["action"] = "approve_project_card"
+    return result
+
+
+def reject_project_card(
+    approval_id: str,
+    *,
+    decided_by: str = "operator",
+    decision_reason: Optional[str] = None,
+) -> dict[str, Any]:
+    """Reject any governed card proposal; code-card name remains compatible."""
+    result = reject_code_card(
+        approval_id,
+        decided_by=decided_by,
+        decision_reason=decision_reason,
+    )
+    result["action"] = "reject_project_card"
+    return result
+
+
 def list_code_card_approvals(
     project_id: str,
     *,
@@ -1107,17 +1360,22 @@ def sync_project_progress(
             statuses=("pending", "approved"),
         )
         previous = pdb.get_project_progress(project_conn, project.id) or {}
+        approval_phase = (
+            "awaiting_direction_change_approval"
+            if pending and pending[0].get("action") == "direction_change"
+            else "awaiting_code_approval"
+        )
         if project.status == "completed":
             phase = "completed"
             next_action = None
         elif project.status == "paused" and pending:
-            phase = "awaiting_code_approval"
+            phase = approval_phase
             next_action = f"Approve or reject {pending[0]['id']}"
         elif project.status == "paused":
             phase = "paused"
             next_action = "Resume the project when the operator is ready"
         elif pending:
-            phase = "awaiting_code_approval"
+            phase = approval_phase
             next_action = f"Approve or reject {pending[0]['id']}"
         elif counts.get("blocked", 0):
             phase = "blocked"

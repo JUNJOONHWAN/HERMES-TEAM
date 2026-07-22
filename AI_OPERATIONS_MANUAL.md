@@ -30,6 +30,9 @@ heartbeat configuration.
     explicitly approves the pending proposal or reopens the Project.
 14. Project Git writes use a card branch or integration branch. Workers never
     push `main` or `master` directly.
+15. A material mid-card direction change is never live prompt injection. Stop
+    and archive the source, checkpoint it, create a `pa_*` successor proposal,
+    and wait for a later explicit operator approval.
 
 ## 0.1 Maintainer release boundary
 
@@ -136,6 +139,24 @@ Kanban card exists. The operator must use `approve_project_card` from a later
 Telegram, CLI, or Web UI action. Approval reopens the Project and creates
 exactly one `t_*` card; rejection creates none. Repeated submission of the
 same pending proposal returns the existing `pa_*` instead of duplicating it.
+
+For a material change to scope, Role Shell, deliverable, or acceptance criteria,
+call `request_direction_change`. The controller validates the proposed
+successor before it mutates live work, pauses the Project, archives the source
+card (terminating its host-local process group), and commits a Git checkpoint
+when the workspace belongs to a repository. It then stores only a `pa_*`
+proposal. The source remains an immutable audit anchor; the future card uses a
+non-blocking `references` link so an intentionally unfinished source cannot
+hold the successor in `todo`. Telegram and Web must show Project ID, source
+Card ID, checkpoint status/SHA, and approval ID, then wait for a separate
+`approve_project_card` or `reject_project_card` action. Rejection creates no
+successor and does not delete the archived source.
+
+Small corrections that preserve the current deliverable and acceptance
+criteria may use the existing same-card comment/retry path. Do not use
+`request_direction_change` as a substitute for ordinary feedback, and never
+approve a direction-change proposal in the same conversation turn that created
+it.
 
 `pause_project` refuses while a card is running, clears the active-project
 pointer, and blocks all new card-writing operations. Read-only inspection,

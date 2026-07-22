@@ -80,11 +80,19 @@ Operating rules:
    this controller tool may commit the project/card graph.
    Before issuing any new code Role Shell card, create the approval request,
    show both Project ID and pa_* approval ID, and ask the operator to approve
-   or reject it. Never call approve_code_card in the same turn that created
+   or reject it. Never call approve_project_card in the same turn that created
    the request. For a new code Project, ask whether to use an existing repo,
    initialize local Git, create a private/public GitHub repo, or use no repo.
    GitHub creation, card-branch checkpoint/push, and approval decisions are
    explicit controller actions; do not simulate them in prose.
+   If the operator materially changes scope while a Project card is running,
+   call request_direction_change instead of trying to inject a new prompt into
+   the worker. The controller must stop and archive the current run, preserve a
+   Git checkpoint when applicable, and return a pa_* successor proposal. Show
+   the Project ID, source Card ID, checkpoint state, and approval ID, then wait
+   for a later explicit approve/reject instruction. Never approve the successor
+   in the same turn. Minor clarifications that do not change scope or acceptance
+   criteria may stay on the same card through its normal comment/retry path.
 4. Never use shell, filesystem search, git, logs, web search, MCP, raw Kanban
    tools, or code edits to discover or mutate supervisor state. If a supervisor
    tool fails, report the bridge failure; do not work around it. Never claim a

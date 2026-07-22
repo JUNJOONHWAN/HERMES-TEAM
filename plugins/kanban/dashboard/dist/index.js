@@ -2178,7 +2178,7 @@
         const id = res && res.project && res.project.id;
         const approvalId = res && res.approval_request && res.approval_request.id;
         setMsg({ ok: true, text: approvalId
-          ? `Project ${id} · code approval ${approvalId} pending`
+          ? `Project ${id} · card approval ${approvalId} pending`
           : `Project started${id ? `: ${id}` : ""}` });
       }).catch(function (e) {
         setMsg({ ok: false, text: parseApiErrorMessage(e) });
@@ -2228,7 +2228,7 @@
         const id = res && res.card && res.card.id;
         const approvalId = res && res.approval_request && res.approval_request.id;
         setMsg({ ok: true, text: approvalId
-          ? `Project ${selected.id} · code approval ${approvalId} pending`
+          ? `Project ${selected.id} · card approval ${approvalId} pending`
           : id
             ? `Project ${selected.id} · root card ${id}`
             : `Project ${selected.id} · root card created` });
@@ -2240,7 +2240,7 @@
     const decideApproval = function (approvalId, action) {
       if (busy) return;
       const verb = action === "approve" ? "approve and create" : "reject";
-      if (!window.confirm(`${verb} code card request ${approvalId}?`)) return;
+      if (!window.confirm(`${verb} project card request ${approvalId}?`)) return;
       setBusy(true); setMsg(null);
       props.onApproval(approvalId, action)
         .then(function (res) {
@@ -2350,11 +2350,12 @@
         className: "mt-2 flex flex-col gap-1",
       }, (selected.approval_requests || []).map(function (approval) {
         return h("div", { key: approval.id, className: "flex flex-wrap items-center gap-2 text-xs" },
-          h("span", null, `${selected.id} · ${approval.id} · ${approval.title}`),
+          h("span", null,
+            `${selected.id} · ${approval.id} · ${approval.shell_key || "card"} · ${approval.title}`),
           h(Button, {
             size: "sm", disabled: busy,
             onClick: function () { decideApproval(approval.id, "approve"); },
-          }, "Approve code card"),
+          }, "Approve card"),
           h(Button, {
             size: "sm", variant: "outline", disabled: busy,
             onClick: function () { decideApproval(approval.id, "reject"); },
@@ -3912,8 +3913,12 @@
           const created = cards && cards.length
             ? cards.map(function (c) { return c.id; }).join(", ")
             : (res && res.card && res.card.id);
+          const approvalId = res && res.approval_request && res.approval_request.id;
+          const checkpoint = res && res.checkpoint && res.checkpoint.status;
           setMsg({ ok: true, text: `${action} · project ${task.project_id}` +
-            (created ? ` · card ${created}` : "") });
+            (created ? ` · card ${created}` : "") +
+            (approvalId ? ` · approval ${approvalId} pending` : "") +
+            (checkpoint ? ` · checkpoint ${checkpoint}` : "") });
         })
         .catch(function (e) { setMsg({ ok: false, text: parseApiErrorMessage(e) }); })
         .finally(function () { setBusy(false); });
@@ -3939,6 +3944,35 @@
       invoke("split", { cards: cards });
     };
 
+    const changeDirection = function () {
+      const title = window.prompt("Successor card title");
+      if (title === null || !title.trim()) return;
+      const reason = window.prompt(
+        "Why must this card stop and change direction?",
+        "Scope or acceptance criteria changed",
+      );
+      if (reason === null || !reason.trim()) return;
+      const body = window.prompt("Successor instructions (optional)", "");
+      if (body === null) return;
+      const shell = window.prompt("Successor Role Shell (blank = same role)", "");
+      if (shell === null) return;
+      const criteria = window.prompt(
+        "Successor acceptance criteria (one per line)",
+        "Revised scope is complete\nRelevant validation passes\nEvidence is attached",
+      );
+      if (criteria === null) return;
+      if (!window.confirm(
+        `Stop and preserve card ${task.id}, then create an approval-only successor draft?`,
+      )) return;
+      invoke("direction-change", {
+        title: title.trim(),
+        reason: reason.trim(),
+        body: body.trim() || null,
+        shell_key: shell.trim() || null,
+        acceptance_criteria: criteria.split("\n").map(function (s) { return s.trim(); }).filter(Boolean),
+      });
+    };
+
     const verify = function () {
       const title = window.prompt("Verification card title", `Verify ${task.id}: ${task.title || "card"}`);
       if (title === null || !title.trim()) return;
@@ -3961,6 +3995,9 @@
         h(Button, { size: "sm", variant: "outline", disabled: busy, onClick: followUp }, "Follow-up"),
         h(Button, { size: "sm", variant: "outline", disabled: busy, onClick: split }, "Split"),
         h(Button, { size: "sm", variant: "outline", disabled: busy, onClick: verify }, "Verify"),
+        task.status !== "done" && task.status !== "archived" ? h(Button, {
+          size: "sm", variant: "outline", disabled: busy, onClick: changeDirection,
+        }, "Change direction") : null,
         task.status !== "done" && task.status !== "running" ? h(Button, {
           size: "sm", variant: "outline", disabled: busy, onClick: recover,
         }, "Recover") : null,
@@ -3969,7 +4006,7 @@
         className: msg.ok ? "hermes-kanban-msg-ok" : "hermes-kanban-msg-err",
       }, msg.text) : null,
       h("div", { className: "text-[10px] text-muted-foreground mt-2" },
-        "Completed cards stay immutable. Follow-up and recovery always create linked cards."),
+        "Direction change stops and checkpoints the source, then waits for approval before creating a linked successor."),
     );
   }
 

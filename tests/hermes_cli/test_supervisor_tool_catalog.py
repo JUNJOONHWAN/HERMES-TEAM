@@ -22,6 +22,9 @@ def test_supervisor_toolset_exposes_native_project_controller():
     ]["enum"]
     assert "add_project_card" in actions
     assert "pause_project" in actions
+    assert "request_direction_change" in actions
+    assert "approve_project_card" in actions
+    assert "reject_project_card" in actions
     assert "approve_code_card" in actions
     assert "checkpoint_card_git" in actions
 

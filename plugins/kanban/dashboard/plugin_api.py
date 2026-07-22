@@ -788,6 +788,20 @@ class CardContinueBody(BaseModel):
     milestone: Optional[str] = None
 
 
+class CardDirectionChangeBody(BaseModel):
+    title: str
+    reason: str
+    body: Optional[str] = None
+    shell_key: Optional[str] = None
+    acceptance_criteria: list[str] = Field(default_factory=list)
+    input_refs: list[str] = Field(default_factory=list)
+    workspace_kind: Optional[str] = None
+    workspace_path: Optional[str] = None
+    priority: int = 0
+    executor_id: Optional[str] = None
+    milestone: Optional[str] = None
+
+
 class CardSplitBody(BaseModel):
     cards: list[dict[str, Any]] = Field(default_factory=list)
 
@@ -930,7 +944,7 @@ def approve_project_code_card(
     payload: ProjectApprovalDecisionBody,
 ):
     try:
-        return project_card_controller.approve_code_card(
+        return project_card_controller.approve_project_card(
             approval_id,
             decided_by=payload.decided_by,
             decision_reason=payload.reason,
@@ -945,7 +959,7 @@ def reject_project_code_card(
     payload: ProjectApprovalDecisionBody,
 ):
     try:
-        return project_card_controller.reject_code_card(
+        return project_card_controller.reject_project_card(
             approval_id,
             decided_by=payload.decided_by,
             decision_reason=payload.reason,
@@ -1002,6 +1016,31 @@ def continue_managed_card(card_id: str, payload: CardContinueBody):
         )
     except (ValueError, project_card_controller.ProjectCardControllerError) as exc:
         raise HTTPException(status_code=400, detail=str(exc))
+
+
+@router.post("/cards/{card_id}/direction-change")
+def request_managed_card_direction_change(
+    card_id: str,
+    payload: CardDirectionChangeBody,
+):
+    try:
+        return project_card_controller.request_direction_change(
+            card_id,
+            title=payload.title,
+            reason=payload.reason,
+            body=payload.body,
+            shell_key=payload.shell_key,
+            acceptance_criteria=payload.acceptance_criteria,
+            input_refs=payload.input_refs,
+            workspace_kind=payload.workspace_kind,
+            workspace_path=payload.workspace_path,
+            priority=payload.priority,
+            executor_id=payload.executor_id,
+            milestone=payload.milestone,
+            created_by="dashboard-project-card-controller",
+        )
+    except (ValueError, project_card_controller.ProjectCardControllerError) as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
 
 
 @router.post("/cards/{card_id}/split")

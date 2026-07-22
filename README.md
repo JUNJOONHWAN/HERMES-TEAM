@@ -68,6 +68,10 @@ execution adapters:
   durable `pa_*` approval request and puts the Project in `paused`. No Kanban
   task exists, and nothing can dispatch, until an operator approves it from
   Telegram or the web UI.
+- **Audited direction changes:** a material mid-card scope change stops and
+  archives the current worker, checkpoints its Git worktree, and creates only
+  a `pa_*` successor draft. The replacement `t_*` card is linked to the
+  preserved source and cannot exist or dispatch before separate approval.
 - **Separate Project DB:** milestone, phase, card counts, pending approvals,
   repository identity, commit SHA, push receipt, and Git events survive apart
   from the Kanban execution ledger.

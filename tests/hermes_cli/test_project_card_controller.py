@@ -429,6 +429,133 @@ def test_rejecting_code_card_never_creates_task(project_control_home):
     assert summary["project"]["status"] == "active"
 
 
+def test_direction_change_stops_source_and_waits_for_successor_approval(
+    project_control_home,
+):
+    started = controller.start_project(
+        name="Audited direction change",
+        goal="Implement the original direction",
+        shell_key="operations",
+    )
+    project_id = started["project"]["id"]
+    source = started["card"]
+    _mark_status(source["id"], "running")
+
+    requested = controller.request_direction_change(
+        source["id"],
+        title="Implement the corrected direction",
+        reason="Acceptance criteria changed",
+        body="Preserve the useful work and replace the obsolete path.",
+        shell_key="operations",
+        acceptance_criteria=["Corrected path is verified"],
+        created_by="test-operator",
+    )
+
+    assert requested["project_id"] == project_id
+    assert requested["source_status"] == "archived"
+    assert requested["successor_card"] is None
+    assert requested["approval_required"] is True
+    assert requested["checkpoint"]["status"] == "not_applicable"
+    approval = requested["approval_request"]
+    assert approval["action"] == "direction_change"
+    assert approval["shell_key"] == "operations"
+    assert approval["request"]["relation_type"] == "references"
+    assert approval["request"]["direction_change"]["reason"] == (
+        "Acceptance criteria changed"
+    )
+
+    pending = controller.inspect_project(project_id)
+    assert pending["project"]["status"] == "paused"
+    assert pending["progress"]["phase"] == "awaiting_direction_change_approval"
+    assert [card["id"] for card in pending["cards"]] == [source["id"]]
+    assert pending["cards"][0]["status"] == "archived"
+
+    approved = controller.approve_project_card(
+        approval["id"], decided_by="test-operator"
+    )
+    assert approved["action"] == "approve_project_card"
+    successor = approved["card"]
+    assert successor["project_id"] == project_id
+    assert successor["root_task_id"] == source["id"]
+    assert "Acceptance criteria changed" in successor["body"]
+    incoming = controller.inspect_card(successor["id"])["links"]["incoming"]
+    assert incoming == [
+        {
+            "task_id": source["id"],
+            "relation_type": "references",
+            "blocking": False,
+        }
+    ]
+    assert controller.inspect_project(project_id)["project"]["status"] == "active"
+
+
+def test_direction_change_waits_for_confirmed_worker_termination(
+    project_control_home,
+):
+    started = controller.start_project(
+        name="Remote worker direction change",
+        goal="Do not checkpoint while the previous worker can still write",
+        shell_key="operations",
+    )
+    project_id = started["project"]["id"]
+    source = started["card"]
+    with kb.connect_closing(board="default") as conn:
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET status = 'running', worker_pid = ?, "
+                "claim_lock = ? WHERE id = ?",
+                (999999, "foreign-host:direction", source["id"]),
+            )
+
+    with pytest.raises(
+        controller.ProjectCardControllerError,
+        match="worker termination is still pending",
+    ):
+        controller.request_direction_change(
+            source["id"],
+            title="Replacement after a confirmed stop",
+            reason="The acceptance contract changed",
+        )
+
+    with kb.connect_closing(board="default") as conn:
+        stopped = kb.get_task(conn, source["id"])
+    assert stopped is not None
+    assert stopped.status == "archived"
+    assert stopped.worker_pid == 999999
+    assert controller.inspect_project(project_id)["project"]["status"] == "paused"
+    with pdb.connect_closing() as conn:
+        assert pdb.list_card_approvals(conn, project_id=project_id) == []
+
+
+def test_rejected_direction_change_keeps_source_archived_without_successor(
+    project_control_home,
+):
+    started = controller.start_project(
+        name="Rejected direction change",
+        goal="Run the original task",
+        shell_key="operations",
+    )
+    source = started["card"]
+    requested = controller.request_direction_change(
+        source["id"],
+        title="Unapproved replacement",
+        reason="Operator is considering another scope",
+    )
+    rejected = controller.reject_project_card(
+        requested["approval_request"]["id"],
+        decided_by="test-operator",
+        decision_reason="keep the project stopped",
+    )
+
+    assert rejected["card"] is None
+    assert rejected["action"] == "reject_project_card"
+    summary = controller.inspect_project(started["project"]["id"])
+    assert len(summary["cards"]) == 1
+    assert summary["cards"][0]["id"] == source["id"]
+    assert summary["cards"][0]["status"] == "archived"
+    assert summary["project"]["status"] == "active"
+
+
 def test_operator_pause_is_a_durable_card_creation_gate(project_control_home):
     started = controller.start_project(
         name="Paused project",
@@ -508,6 +635,16 @@ def test_repository_init_and_card_branch_commit_push_are_project_audited(
     assert checkpoint["branch"] in remote_branches
     summary = controller.inspect_project(started["project"]["id"])
     assert summary["git_events"][0]["event_type"] == "card_branch_pushed"
+
+    direction = controller.request_direction_change(
+        card["id"],
+        title="Replace the committed implementation direction",
+        reason="The integration contract changed",
+    )
+    assert direction["checkpoint"]["status"] == "committed"
+    assert direction["checkpoint"]["sha"] == checkpoint["sha"]
+    assert controller.inspect_card(card["id"])["card"]["status"] == "archived"
+    assert direction["approval_request"]["status"] == "pending"
 
 
 def test_legacy_schema_migrates_to_independent_threads_and_typed_links(

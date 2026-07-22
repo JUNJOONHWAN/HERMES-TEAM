@@ -152,6 +152,19 @@ Project를 `paused`로 바꾼다. 운영자가 다음 Telegram/Web UI/CLI 동작
 돌려주며, 거절하면 카드가 생기지 않는다. 승인 생성 실패 시에는 `pa_*`와
 `paused` 상태가 복원되어 자동 실행으로 새지 않는다.
 
+실행 중 범위·산출물·Role Shell·완료 조건이 크게 바뀌면 worker 입력 스트림에 새
+프롬프트를 주입하지 않는다. 컨트롤러의 `request_direction_change`가 먼저 후속
+계약을 검증하고 Project를 pause한 뒤, 원본 `t_*`를 archive하여 프로세스 그룹을
+종료한다. Git 작업공간은 그 시점의 변경을 checkpoint commit으로 고정하고, Git이
+아닌 작업공간은 파일을 그대로 보존하며 `not_applicable`을 기록한다. 그 다음에도
+새 카드는 만들지 않고 `pa_*` 승인 초안만 Project DB에 쓴다.
+
+승인 후 생성되는 후속 카드는 원본과 비차단 `references`로 연결된다. 의도적으로
+미완료인 원본이 후속을 `todo`에 묶지 않으면서도, 원본 댓글·run·checkpoint SHA와
+후속 결과를 수개월 뒤 다시 추적할 수 있다. 승인 거절은 후속 카드를 만들지 않으며
+원본 archived 감사 기록도 삭제하지 않는다. Telegram과 Web UI는 이 동일 컨트롤러
+함수를 호출하고 `p_*`, 원본 `t_*`, checkpoint, `pa_*`를 함께 표시한다.
+
 `pause_project`는 실행 카드가 있을 때 거부하고, 성공하면 active pointer를
 해제하며 모든 새 카드 쓰기를 막는다. `reopen_project`는 명시적 운영자 동작이다.
 따라서 M0/M1 결과가 다음 마일스톤을 제안해도 M2가 자동 발행되는 불도저 구조가

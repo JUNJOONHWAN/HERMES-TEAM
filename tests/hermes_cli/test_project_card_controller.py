@@ -99,6 +99,16 @@ def test_controller_owns_project_and_card_thread_lifecycle(project_control_home)
     assert split_link["relation_type"] == "references"
     assert split_link["blocking"] is False
 
+    independent = controller.add_project_card(
+        project["id"],
+        title="Start an independent release thread",
+        shell_key="operations",
+        acceptance_criteria=["Release thread is independently closable"],
+    )["card"]
+    assert independent["project_id"] == project["id"]
+    assert independent["root_task_id"] == independent["id"]
+    assert controller.inspect_card(independent["id"])["links"]["incoming"] == []
+
     before_invalid_split = len(controller.inspect_project(project["id"])["cards"])
     with pytest.raises(controller.ProjectCardControllerError, match="unknown role shell"):
         controller.split_card(
@@ -128,7 +138,11 @@ def test_controller_owns_project_and_card_thread_lifecycle(project_control_home)
                 split[1]["id"],
                 verification["id"],
             ],
-        }
+        },
+        {
+            "root_card_id": independent["id"],
+            "card_ids": [independent["id"]],
+        },
     ]
 
 
@@ -163,6 +177,12 @@ def test_recovery_is_nonblocking_and_project_close_is_guarded(project_control_ho
 
     with pytest.raises(controller.ProjectCardControllerError, match="reopen"):
         controller.continue_card(root_id, title="Must not silently reopen")
+    with pytest.raises(controller.ProjectCardControllerError, match="reopen"):
+        controller.add_project_card(
+            project_id,
+            title="Must not silently reopen either",
+            shell_key="operations",
+        )
 
     reopened = controller.reopen_project(project_id)
     assert reopened["project"]["status"] == "active"
@@ -186,8 +206,23 @@ def test_supervisor_common_gateway_calls_native_controller(project_control_home)
     assert payload["action"] == "start_project"
     assert payload["card"]["session_id"] == "telegram-session-1"
     assert payload["card"]["created_by"] == "hermes-project-card-controller"
+    second = json.loads(
+        supervisor_tools._handle_project_cards(
+            {
+                "action": "add_project_card",
+                "project_id": payload["project"]["id"],
+                "title": "Start a separate reporting thread",
+                "shell_key": "operations",
+            },
+            session_id="telegram-session-1",
+        )
+    )
+    assert second["card"]["root_task_id"] == second["card"]["id"]
     summary = controller.inspect_project(payload["project"]["id"])
-    assert [card["id"] for card in summary["cards"]] == [payload["card"]["id"]]
+    assert [card["id"] for card in summary["cards"]] == [
+        payload["card"]["id"],
+        second["card"]["id"],
+    ]
 
 
 def test_legacy_schema_migrates_to_independent_threads_and_typed_links(

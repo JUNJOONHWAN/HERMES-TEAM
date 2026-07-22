@@ -1407,6 +1407,24 @@ def _handle_project_cards(args: dict[str, Any], **_kwargs) -> str:
                 executor_id=(str(args.get("executor_id") or "").strip() or None),
                 **common,
             )
+        elif action == "add_project_card":
+            result = project_cards.add_project_card(
+                str(args.get("project_id") or ""),
+                title=str(args.get("title") or ""),
+                body=(str(args.get("body") or "").strip() or None),
+                shell_key=str(args.get("shell_key") or ""),
+                acceptance_criteria=args.get("acceptance_criteria"),
+                input_refs=args.get("input_refs"),
+                workspace_kind=(
+                    str(args.get("workspace_kind") or "").strip() or None
+                ),
+                workspace_path=(
+                    str(args.get("workspace_path") or "").strip() or None
+                ),
+                priority=int(args.get("priority") or 0),
+                executor_id=(str(args.get("executor_id") or "").strip() or None),
+                **common,
+            )
         elif action == "continue_card":
             result = project_cards.continue_card(
                 str(args.get("card_id") or ""),
@@ -1951,8 +1969,9 @@ SUPERVISOR_PROJECT_SCHEMA = {
     "name": "supervisor_project",
     "description": (
         "Native deterministic Project/Card Controller. Use it for long-lived "
-        "team projects and card chains: start a project, continue a completed "
-        "or active card with a follow-up, split work into parallel role cards, "
+        "team projects and card chains: start a project, add an independent "
+        "root card inside it, continue a completed or active card with a "
+        "follow-up, split work into parallel role cards, "
         "create an independent verification card, recover failed work through "
         "another compatible adapter, inspect/locate old cards, or close/reopen "
         "a project. This is controller authority, not a worker adapter: workers "
@@ -1967,6 +1986,7 @@ SUPERVISOR_PROJECT_SCHEMA = {
                 "enum": [
                     "list_projects",
                     "start_project",
+                    "add_project_card",
                     "continue_card",
                     "split_card",
                     "verify_card",

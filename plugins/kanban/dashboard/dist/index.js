@@ -988,6 +988,18 @@
       });
     }, [board, loadBoard, loadBoardList, loadProjects, switchBoard]);
 
+    const addProjectCard = useCallback(function (projectId, payload) {
+      return SDK.fetchJSON(`${API}/projects/${encodeURIComponent(projectId)}/cards`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      }).then(function (res) {
+        return Promise.all([loadProjects(), loadBoard()]).then(function () {
+          return res;
+        });
+      });
+    }, [loadBoard, loadProjects]);
+
     const chooseProject = useCallback(function (projectId) {
       const selected = projects.find(function (p) { return p.id === projectId; });
       setProjectFilter(projectId || "");
@@ -1092,6 +1104,7 @@
           board: board,
           onSelect: chooseProject,
           onStart: startProject,
+          onAddCard: addProjectCard,
           onStatus: setProjectStatus,
         }),
         showNewBoard ? h(NewBoardDialog, {
@@ -2099,7 +2112,7 @@
       const goal = window.prompt("First card goal — make it a concrete deliverable");
       if (goal === null || !goal.trim()) return;
       const shell = window.prompt(
-        "Role Shell for the first card (code, browser, market, operations, tool-management, verification)",
+        "Role Shell for the first card (code, browser-research, market, operations, report, tool-management, verification)",
         "code",
       );
       if (shell === null || !shell.trim()) return;
@@ -2142,6 +2155,33 @@
         .finally(function () { setBusy(false); });
     };
 
+    const addRootCard = function () {
+      if (!selected || selected.status !== "active" || busy) return;
+      const title = window.prompt("New independent card title");
+      if (title === null || !title.trim()) return;
+      const shell = window.prompt(
+        "Role Shell for this card (code, browser-research, market, operations, report, tool-management, verification)",
+        "code",
+      );
+      if (shell === null || !shell.trim()) return;
+      const acceptance = window.prompt(
+        "Acceptance criteria (one per line)",
+        "Requested result is complete\nRelevant validation passes\nEvidence is attached to the card",
+      );
+      if (acceptance === null) return;
+      setBusy(true); setMsg(null);
+      props.onAddCard(selected.id, {
+        title: title.trim(),
+        shell_key: shell.trim(),
+        acceptance_criteria: acceptance.split("\n").map(function (s) { return s.trim(); }).filter(Boolean),
+      }).then(function (res) {
+        const id = res && res.card && res.card.id;
+        setMsg({ ok: true, text: `New root card created${id ? `: ${id}` : ""}` });
+      }).catch(function (e) {
+        setMsg({ ok: false, text: parseApiErrorMessage(e) });
+      }).finally(function () { setBusy(false); });
+    };
+
     return h("div", { className: "hermes-kanban-section" },
       h("div", { className: "hermes-kanban-section-head-row" },
         h("div", null,
@@ -2164,6 +2204,10 @@
           ),
           h(Button, { size: "sm", disabled: busy, onClick: start },
             busy ? "Working…" : "+ Start project"),
+          selected && selected.status === "active" ? h(Button, {
+            size: "sm", variant: "outline", disabled: busy,
+            onClick: addRootCard,
+          }, "+ New root card") : null,
           selected && selected.status === "active" ? h(Button, {
             size: "sm", variant: "outline", disabled: busy,
             onClick: function () { changeStatus("close"); },

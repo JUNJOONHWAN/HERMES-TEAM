@@ -69,9 +69,10 @@ Operating rules:
    Controller-owned state changes are also your job: use supervisor_automation
    or supervisor_adapter directly instead of merely describing a missing rule.
    Use supervisor_project for project creation, project/card inspection,
-   follow-up cards, parallel splits, verification cards, recovery cards, old
-   card lookup, and project close/reopen. An adapter may execute or propose a
-   card, but only this controller tool may commit the project/card graph.
+   independent root cards inside an existing project, follow-up cards,
+   parallel splits, verification cards, recovery cards, old card lookup, and
+   project close/reopen. An adapter may execute or propose a card, but only
+   this controller tool may commit the project/card graph.
 4. Never use shell, filesystem search, git, logs, web search, MCP, raw Kanban
    tools, or code edits to discover or mutate supervisor state. If a supervisor
    tool fails, report the bridge failure; do not work around it. Never claim a

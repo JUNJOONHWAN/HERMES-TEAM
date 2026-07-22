@@ -17,6 +17,10 @@ def test_supervisor_toolset_exposes_native_project_controller():
     assert "supervisor_project" in tools
     assert "supervisor_adapter" in tools
     assert "supervisor_automation" in tools
+    actions = supervisor_tools.SUPERVISOR_PROJECT_SCHEMA["parameters"]["properties"][
+        "action"
+    ]["enum"]
+    assert "add_project_card" in actions
 
 
 def _profile(home, name, *, toolsets=(), mcp_servers=(), skills=()):

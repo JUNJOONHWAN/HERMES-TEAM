@@ -757,6 +757,18 @@ class ProjectStartBody(BaseModel):
     executor_id: Optional[str] = None
 
 
+class ProjectCardCreateBody(BaseModel):
+    title: str
+    shell_key: str
+    body: Optional[str] = None
+    acceptance_criteria: list[str] = Field(default_factory=list)
+    input_refs: list[str] = Field(default_factory=list)
+    workspace_kind: Optional[str] = None
+    workspace_path: Optional[str] = None
+    priority: int = 0
+    executor_id: Optional[str] = None
+
+
 class CardContinueBody(BaseModel):
     title: str
     body: Optional[str] = None
@@ -818,6 +830,26 @@ def inspect_managed_project(project_id: str):
         return project_card_controller.inspect_project(project_id)
     except (ValueError, project_card_controller.ProjectCardControllerError) as exc:
         raise HTTPException(status_code=404, detail=str(exc))
+
+
+@router.post("/projects/{project_id}/cards")
+def add_managed_project_card(project_id: str, payload: ProjectCardCreateBody):
+    try:
+        return project_card_controller.add_project_card(
+            project_id,
+            title=payload.title,
+            shell_key=payload.shell_key,
+            body=payload.body,
+            acceptance_criteria=payload.acceptance_criteria,
+            input_refs=payload.input_refs,
+            workspace_kind=payload.workspace_kind,
+            workspace_path=payload.workspace_path,
+            priority=payload.priority,
+            executor_id=payload.executor_id,
+            created_by="dashboard-project-card-controller",
+        )
+    except (ValueError, project_card_controller.ProjectCardControllerError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
 
 
 @router.post("/projects/{project_id}/close")

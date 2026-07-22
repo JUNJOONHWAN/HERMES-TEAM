@@ -323,6 +323,50 @@ def continue_card(
     }
 
 
+def add_project_card(
+    project_id: str,
+    *,
+    title: str,
+    shell_key: str,
+    body: Optional[str] = None,
+    acceptance_criteria: Optional[Iterable[Any]] = None,
+    input_refs: Optional[Iterable[Any]] = None,
+    workspace_kind: Optional[str] = None,
+    workspace_path: Optional[str] = None,
+    priority: int = 0,
+    executor_id: Optional[str] = None,
+    session_id: Optional[str] = None,
+    created_by: str = "project-card-controller",
+) -> dict[str, Any]:
+    """Create an independent root-card thread inside an active Project."""
+    project = _project(project_id, include_completed=False)
+    board = _board_for_project(project)
+    with kb.connect_closing(board=board) as conn:
+        registry.ensure_schema(conn)
+        card = _create_card(
+            conn=conn,
+            project=project,
+            title=title,
+            body=body,
+            shell_key=shell_key,
+            acceptance_criteria=acceptance_criteria,
+            input_refs=input_refs,
+            workspace_kind=workspace_kind,
+            workspace_path=workspace_path,
+            priority=priority,
+            executor_id=executor_id,
+            session_id=session_id,
+            created_by=created_by,
+        )
+    return {
+        "schema": SCHEMA,
+        "action": "add_project_card",
+        "project_id": project.id,
+        "board": board,
+        "card": asdict(card),
+    }
+
+
 def split_card(
     card_id: str,
     *,

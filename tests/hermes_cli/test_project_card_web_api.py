@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
 from hermes_cli import kanban_db as kb
@@ -58,6 +60,18 @@ def test_web_api_uses_same_native_project_card_controller(project_api_client):
     assert projects.status_code == 200
     assert projects.json()["projects"][0]["id"] == project_id
 
+    independent = project_api_client.post(
+        f"/api/plugins/kanban/projects/{project_id}/cards",
+        json={
+            "title": "Start an independent verification stream",
+            "shell_key": "verification",
+            "acceptance_criteria": ["Independent root is preserved"],
+        },
+    )
+    assert independent.status_code == 200, independent.text
+    independent_card = independent.json()["card"]
+    assert independent_card["root_task_id"] == independent_card["id"]
+
     follow = project_api_client.post(
         f"/api/plugins/kanban/cards/{root_id}/continue",
         json={"title": "Add an intuitive follow-up action"},
@@ -81,3 +95,17 @@ def test_web_api_uses_same_native_project_card_controller(project_api_client):
     )
     assert closed.status_code == 409
     assert "open cards" in closed.json()["detail"]
+
+
+def test_web_bundle_exposes_independent_root_card_action():
+    bundle = (
+        Path(__file__).resolve().parents[2]
+        / "plugins"
+        / "kanban"
+        / "dashboard"
+        / "dist"
+        / "index.js"
+    ).read_text(encoding="utf-8")
+
+    assert "/projects/${encodeURIComponent(projectId)}/cards" in bundle
+    assert "+ New root card" in bundle

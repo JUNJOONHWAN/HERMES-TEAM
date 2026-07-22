@@ -18,6 +18,7 @@ import asyncio
 import base64
 import json
 import shutil
+import socket
 import subprocess
 import tempfile
 import time
@@ -40,23 +41,20 @@ def _find_chrome() -> str:
 
 
 @pytest.fixture
-def chrome_cdp(request):
+def chrome_cdp():
     """Start a headless Chrome with --remote-debugging-port, yield its WS URL.
 
-    Uses a unique port per xdist worker to avoid cross-worker collisions.
+    Uses an OS-assigned free port for every fixture instance. A fixed port is
+    unsafe here because a slow or orphaned Chromium from the previous test can
+    make the next test attach to the wrong browser.
     Always launches with ``--site-per-process`` so cross-origin iframes
     become real OOPIFs (needed by the iframe interaction tests).
     """
 
-    # xdist worker_id is "master" in single-process mode or "gw0".."gwN" otherwise.
-    # Under subprocess-per-file isolation there's no xdist, so we fall back
-    # to "master" via the session-scoped fixture below.
-    worker_id = request.getfixturevalue("worker_id") if "worker_id" in request.fixturenames else "master"
-    if worker_id == "master":
-        port_offset = 0
-    else:
-        port_offset = int(worker_id.lstrip("gw"))
-    port = 9225 + port_offset
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as port_probe:
+        port_probe.bind(("127.0.0.1", 0))
+        port = int(port_probe.getsockname()[1])
+
     profile = tempfile.mkdtemp(prefix="hermes-supervisor-test-")
     proc = subprocess.Popen(
         [

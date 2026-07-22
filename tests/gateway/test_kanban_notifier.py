@@ -161,6 +161,38 @@ def test_project_notification_always_shows_project_and_card_ids(tmp_path, monkey
     assert f"카드: {tid}" in adapter.sent[0]["text"]
 
 
+def test_project_claim_notification_shows_working_project_and_card_ids(
+    tmp_path, monkeypatch
+):
+    db_path = tmp_path / "project-working-identity.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(
+            conn,
+            title="implement milestone",
+            assignee="worker",
+        )
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET project_id = ? WHERE id = ?",
+                ("p_7e4d6ef5", tid),
+            )
+        kb.add_notify_sub(conn, task_id=tid, platform="telegram", chat_id="chat-1")
+        assert kb.claim_task(conn, tid, claimer="worker") is not None
+    finally:
+        conn.close()
+
+    adapter = RecordingAdapter()
+    asyncio.run(_run_one_notifier_tick(monkeypatch, _make_runner(adapter)))
+
+    assert len(adapter.sent) == 1
+    assert adapter.sent[0]["text"].startswith("🔄 작업중 · implement milestone")
+    assert "프로젝트: p_7e4d6ef5" in adapter.sent[0]["text"]
+    assert f"카드: {tid}" in adapter.sent[0]["text"]
+
+
 def test_archived_card_suppresses_queued_failure_and_unsubscribes(tmp_path, monkeypatch):
     db_path = tmp_path / "archived-supersedes-failure.db"
     monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))

@@ -255,11 +255,12 @@ class GatewayKanbanWatchersMixin:
         """Poll ``kanban_notify_subs`` and deliver terminal events to users.
 
         For each subscription row, fetches ``task_events`` newer than the
-        stored cursor with kind in the terminal set (``completed``,
-        ``blocked``, ``gave_up``, ``crashed``, ``timed_out``). Sends one
-        message per new event to ``(platform, chat_id, thread_id)``,
-        then advances the cursor. When a task reaches a terminal state
-        (``completed`` / ``archived``), the subscription is removed.
+        stored cursor for the operator-visible lifecycle set. ``claimed``
+        emits a single working notification; terminal events emit their
+        existing result/failure notifications. Sends one message per new
+        event to ``(platform, chat_id, thread_id)``, then advances the cursor.
+        When a task reaches a terminal state (``completed`` / ``archived``),
+        the subscription is removed.
 
         Runs in the gateway event loop; all SQLite work is pushed to a
         thread via ``asyncio.to_thread`` so the loop never blocks on the
@@ -303,7 +304,17 @@ class GatewayKanbanWatchersMixin:
 
         # "status" covers dashboard drag-drop and `_set_status_direct()`
         # writes — surface those transitions to subscribers too.
-        TERMINAL_KINDS = ("completed", "blocked", "gave_up", "crashed", "timed_out", "status", "archived", "unblocked")
+        NOTIFY_KINDS = (
+            "claimed",
+            "completed",
+            "blocked",
+            "gave_up",
+            "crashed",
+            "timed_out",
+            "status",
+            "archived",
+            "unblocked",
+        )
         # Subscriptions are removed only when the task reaches a truly final
         # status (done / archived). We used to also unsub on any terminal
         # event kind (gave_up / crashed / timed_out / blocked), but that
@@ -413,7 +424,7 @@ class GatewayKanbanWatchersMixin:
                                     platform=sub["platform"],
                                     chat_id=sub["chat_id"],
                                     thread_id=sub.get("thread_id") or "",
-                                    kinds=TERMINAL_KINDS,
+                                    kinds=NOTIFY_KINDS,
                                 )
                                 if not events:
                                     continue
@@ -496,7 +507,12 @@ class GatewayKanbanWatchersMixin:
                     delivered_cursor = int(d.get("old_cursor", 0) or 0)
                     for ev in d["events"]:
                         kind = ev.kind
-                        if kind == "completed":
+                        if kind == "claimed":
+                            msg = (
+                                f"🔄 작업중 · {title}\n"
+                                f"{identity}"
+                            )
+                        elif kind == "completed":
                             # The task result is the canonical, complete
                             # user-facing deliverable. The event summary is a
                             # deliberately short handoff and is only a fallback
@@ -544,7 +560,7 @@ class GatewayKanbanWatchersMixin:
                             delivered_cursor = max(delivered_cursor, int(ev.id))
                             continue
                         else:
-                            # archived / unblocked are claimed by TERMINAL_KINDS
+                            # archived / unblocked are claimed by NOTIFY_KINDS
                             # (so the cursor advances past them and they can't
                             # wedge a later completed/blocked event behind an
                             # unclaimed row) but are intentionally SILENT: an
@@ -635,7 +651,7 @@ class GatewayKanbanWatchersMixin:
                         # gave_up / crashed / timed_out the subscription is
                         # kept alive so the user gets notified again if the
                         # dispatcher respawns the task and it cycles into the
-                        # same state. See the longer comment on TERMINAL_KINDS
+                        # same state. See the longer comment on NOTIFY_KINDS
                         # above for the failure mode this prevents.
                         task_terminal = task and task.status in {"done", "archived"}
                         _WAKE_KINDS = ("completed", "gave_up", "crashed", "timed_out", "blocked")

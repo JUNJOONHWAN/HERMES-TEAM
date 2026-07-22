@@ -13,6 +13,6 @@ def test_distribution_release_matches_runtime_versions():
     )
 
     assert payload["schema"] == "hermes.distribution-release.v1"
-    assert payload["distribution_version"] == "0.1.6"
+    assert payload["distribution_version"] == "0.1.7"
     assert payload["distribution_version"] == hermes_cli.__distribution_version__
     assert payload["engine_version"] == "0.18.0"

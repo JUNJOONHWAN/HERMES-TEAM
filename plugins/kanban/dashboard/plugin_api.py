@@ -790,6 +790,8 @@ class CardActionBody(BaseModel):
     body: Optional[str] = None
     shell_key: Optional[str] = None
     acceptance_criteria: list[str] = Field(default_factory=list)
+    workspace_kind: Optional[str] = None
+    workspace_path: Optional[str] = None
     executor_id: Optional[str] = None
 
 
@@ -934,6 +936,8 @@ def recover_managed_card(card_id: str, payload: CardActionBody):
             body=payload.body,
             shell_key=payload.shell_key,
             acceptance_criteria=payload.acceptance_criteria,
+            workspace_kind=payload.workspace_kind,
+            workspace_path=payload.workspace_path,
             executor_id=payload.executor_id,
             created_by="dashboard-project-card-controller",
         )

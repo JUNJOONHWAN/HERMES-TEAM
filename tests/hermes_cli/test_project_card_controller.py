@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import subprocess
 
 import pytest
 
@@ -146,6 +147,94 @@ def test_controller_owns_project_and_card_thread_lifecycle(project_control_home)
     ]
 
 
+def test_non_git_project_path_uses_durable_directory(project_control_home, tmp_path):
+    project_dir = tmp_path / "long-running-project"
+    project_dir.mkdir()
+    (project_dir / "PRD.md").write_text("# PRD\n", encoding="utf-8")
+
+    started = controller.start_project(
+        name="Non-Git project",
+        goal="Turn the PRD into an implementation roadmap",
+        shell_key="code",
+        primary_path=str(project_dir),
+    )
+
+    assert started["card"]["workspace_kind"] == "dir"
+    assert started["card"]["workspace_path"] == str(project_dir)
+    follow = controller.continue_card(
+        started["card"]["id"],
+        title="Research an unresolved requirement",
+        shell_key="browser",
+    )["card"]
+    assert follow["workspace_kind"] == "dir"
+    assert follow["workspace_path"] == str(project_dir)
+
+
+def test_git_project_path_keeps_code_cards_in_worktrees(
+    project_control_home, tmp_path
+):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", str(repo)], check=True, capture_output=True)
+    subprocess.run(
+        ["git", "-C", str(repo), "config", "user.email", "tests@example.invalid"],
+        check=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(repo), "config", "user.name", "Hermes Tests"],
+        check=True,
+    )
+    (repo / "README.md").write_text("# repo\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(repo), "add", "README.md"], check=True)
+    subprocess.run(
+        ["git", "-C", str(repo), "commit", "-m", "initial"],
+        check=True,
+        capture_output=True,
+    )
+
+    started = controller.start_project(
+        name="Git project",
+        goal="Implement a change in isolation",
+        shell_key="code",
+        primary_path=str(repo),
+    )
+
+    assert started["card"]["workspace_kind"] == "worktree"
+    assert started["card"]["workspace_path"] == str(repo)
+    with kb.connect_closing(board="default") as conn:
+        task = kb.get_task(conn, started["card"]["id"])
+    assert task is not None
+    resolved = kb.resolve_workspace(task, board="default")
+    assert resolved == repo / ".worktrees" / task.id
+    assert (resolved / ".git").exists()
+
+
+def test_explicit_worktree_without_git_anchor_is_rejected_before_card_creation(
+    project_control_home, tmp_path
+):
+    project_dir = tmp_path / "not-a-repo"
+    project_dir.mkdir()
+    started = controller.start_project(
+        name="Invalid worktree",
+        goal="Create a safely classified first card",
+        shell_key="code",
+        primary_path=str(project_dir),
+    )
+    assert started["card"]["workspace_kind"] == "dir"
+    before = len(controller.inspect_project(started["project"]["id"])["cards"])
+    with pytest.raises(
+        controller.ProjectCardControllerError,
+        match="no Git repository anchor",
+    ):
+        controller.add_project_card(
+            started["project"]["id"],
+            title="Must fail before dispatch",
+            shell_key="code",
+            workspace_kind="worktree",
+        )
+    assert len(controller.inspect_project(started["project"]["id"])["cards"]) == before
+
+
 def test_recovery_is_nonblocking_and_project_close_is_guarded(project_control_home):
     started = controller.start_project(
         name="Recovery",
@@ -156,8 +245,16 @@ def test_recovery_is_nonblocking_and_project_close_is_guarded(project_control_ho
     root_id = started["card"]["id"]
     _mark_status(root_id, "blocked")
 
-    recovered = controller.recover_card(root_id)["card"]
+    workspace = project_control_home / "existing-project-dir"
+    workspace.mkdir()
+    recovered = controller.recover_card(
+        root_id,
+        workspace_kind="dir",
+        workspace_path=str(workspace),
+    )["card"]
     assert recovered["status"] == "ready"
+    assert recovered["workspace_kind"] == "dir"
+    assert recovered["workspace_path"] == str(workspace)
     inspected = controller.inspect_card(recovered["id"])
     assert inspected["links"]["incoming"][0] == {
         "task_id": root_id,
@@ -218,10 +315,29 @@ def test_supervisor_common_gateway_calls_native_controller(project_control_home)
         )
     )
     assert second["card"]["root_task_id"] == second["card"]["id"]
+
+    _mark_status(payload["card"]["id"], "blocked")
+    workspace = project_control_home / "supervisor-recovery-dir"
+    workspace.mkdir()
+    recovered = json.loads(
+        supervisor_tools._handle_project_cards(
+            {
+                "action": "recover_card",
+                "card_id": payload["card"]["id"],
+                "workspace_kind": "dir",
+                "workspace_path": str(workspace),
+            },
+            session_id="telegram-session-1",
+        )
+    )["card"]
+    assert recovered["workspace_kind"] == "dir"
+    assert recovered["workspace_path"] == str(workspace)
+
     summary = controller.inspect_project(payload["project"]["id"])
     assert [card["id"] for card in summary["cards"]] == [
         payload["card"]["id"],
         second["card"]["id"],
+        recovered["id"],
     ]
 
 

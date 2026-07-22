@@ -41,7 +41,9 @@ def project_api_client(monkeypatch, tmp_path):
     pdb._INITIALIZED_PATHS.clear()
 
 
-def test_web_api_uses_same_native_project_card_controller(project_api_client):
+def test_web_api_uses_same_native_project_card_controller(
+    project_api_client, tmp_path
+):
     started = project_api_client.post(
         "/api/plugins/kanban/projects/start?board=default",
         json={
@@ -88,6 +90,24 @@ def test_web_api_uses_same_native_project_card_controller(project_api_client):
         "relation_type": "follows",
         "blocking": True,
     }
+
+    with kb.connect_closing(board="default") as conn:
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET status = 'blocked' WHERE id = ?", (root_id,)
+            )
+    workspace = tmp_path / "dashboard-recovery-dir"
+    workspace.mkdir()
+    recovered = project_api_client.post(
+        f"/api/plugins/kanban/cards/{root_id}/recover",
+        json={
+            "workspace_kind": "dir",
+            "workspace_path": str(workspace),
+        },
+    )
+    assert recovered.status_code == 200, recovered.text
+    assert recovered.json()["card"]["workspace_kind"] == "dir"
+    assert recovered.json()["card"]["workspace_path"] == str(workspace)
 
     # Closing remains a controller invariant, not a UI-side optimistic flag.
     closed = project_api_client.post(

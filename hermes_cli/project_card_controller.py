@@ -9,6 +9,7 @@ or mutate the graph directly.
 from __future__ import annotations
 
 from dataclasses import asdict
+from pathlib import Path
 from typing import Any, Iterable, Optional
 
 from hermes_cli import kanban_db as kb
@@ -74,6 +75,80 @@ def _source_shell_key(conn, task: kb.Task) -> str:
 
 def _board_for_project(project: pdb.Project) -> str:
     return str(project.board_slug or kb.DEFAULT_BOARD)
+
+
+def _workspace_for_card(
+    *,
+    project: pdb.Project,
+    shell_key: str,
+    workspace_kind: Optional[str],
+    workspace_path: Optional[str],
+) -> tuple[str, Optional[str]]:
+    """Resolve a safe workspace before the card becomes dispatchable.
+
+    Project folders are not necessarily Git repositories.  Code cards use a
+    linked worktree only when the selected anchor is actually inside a Git
+    repository; otherwise every role uses the durable project directory.  A
+    project with no folder remains an isolated scratch task.
+
+    Explicit workspace choices are honoured, but an explicit worktree is
+    rejected here when it has no Git anchor.  That keeps a bad card out of the
+    dispatcher instead of discovering the configuration error after claiming
+    and retrying it.
+    """
+    requested_kind = str(workspace_kind or "").strip() or None
+    requested_path = str(workspace_path or "").strip() or None
+    if requested_kind and requested_kind not in kb.VALID_WORKSPACE_KINDS:
+        raise ProjectCardControllerError(
+            f"workspace_kind must be one of {sorted(kb.VALID_WORKSPACE_KINDS)}"
+        )
+
+    project_path = str(project.primary_path or "").strip() or None
+    anchor_text = requested_path or project_path
+    anchor = Path(anchor_text).expanduser() if anchor_text else None
+
+    if requested_kind == "worktree":
+        if anchor is None:
+            raise ProjectCardControllerError(
+                "workspace_kind=worktree requires workspace_path or a Project primary_path"
+            )
+        if not anchor.is_absolute():
+            raise ProjectCardControllerError("worktree workspace_path must be absolute")
+        if kb._repo_root_for_worktree_target(anchor) is None:
+            raise ProjectCardControllerError(
+                f"worktree workspace has no Git repository anchor: {anchor}"
+            )
+        return "worktree", str(anchor.resolve(strict=False))
+
+    if requested_kind == "dir":
+        if anchor is None:
+            raise ProjectCardControllerError(
+                "workspace_kind=dir requires workspace_path or a Project primary_path"
+            )
+        if not anchor.is_absolute():
+            raise ProjectCardControllerError("dir workspace_path must be absolute")
+        return "dir", str(anchor.resolve(strict=False))
+
+    if requested_kind == "scratch":
+        if requested_path:
+            raise ProjectCardControllerError(
+                "scratch workspaces are controller-managed; omit workspace_path"
+            )
+        return "scratch", None
+
+    if anchor is None:
+        return "scratch", None
+    if not anchor.is_absolute():
+        raise ProjectCardControllerError("project workspace path must be absolute")
+
+    # Only coding cards need branch isolation.  Research, browser, operations,
+    # and verification cards use the durable Project directory so their
+    # artifacts remain visible to later cards in the same Project.
+    if shell_key == "code":
+        repo_root = kb._repo_root_for_worktree_target(anchor)
+        if repo_root is not None:
+            return "worktree", str(repo_root)
+    return "dir", str(anchor.resolve(strict=False))
 
 
 def _project(
@@ -146,8 +221,12 @@ def _create_card(
     if not title:
         raise ProjectCardControllerError("card title is required")
     shell = _resolve_shell(conn, shell_key)
-    use_project_workspace = shell.shell_key == "code" and bool(project.primary_path)
-    kind = str(workspace_kind or ("worktree" if use_project_workspace else "scratch"))
+    kind, resolved_workspace_path = _workspace_for_card(
+        project=project,
+        shell_key=shell.shell_key,
+        workspace_kind=workspace_kind,
+        workspace_path=workspace_path,
+    )
     refs = _clean_list(input_refs)
     parents: list[str] = []
     root_task_id: Optional[str] = None
@@ -163,14 +242,17 @@ def _create_card(
         body=(str(body).strip() if body and str(body).strip() else None),
         role_shell_id=shell.id,
         project_id=project.id,
-        use_project_workspace=use_project_workspace,
+        # The controller has already classified the Project path.  Do not let
+        # kanban_db's legacy "project path means worktree" inference override
+        # a deliberate durable-directory choice for a non-Git project.
+        use_project_workspace=False,
         root_task_id=root_task_id,
         acceptance_criteria=_acceptance(acceptance_criteria, title),
         input_refs=refs,
         parents=parents,
         parent_link_type=relation_type,
         workspace_kind=kind,
-        workspace_path=(str(workspace_path).strip() if workspace_path else None),
+        workspace_path=resolved_workspace_path,
         priority=int(priority or 0),
         session_id=(str(session_id).strip() if session_id else None),
         adapter_executor_id=(str(executor_id).strip() if executor_id else None),
@@ -498,6 +580,8 @@ def recover_card(
     body: Optional[str] = None,
     shell_key: Optional[str] = None,
     acceptance_criteria: Optional[Iterable[Any]] = None,
+    workspace_kind: Optional[str] = None,
+    workspace_path: Optional[str] = None,
     executor_id: Optional[str] = None,
     session_id: Optional[str] = None,
     created_by: str = "project-card-controller",
@@ -531,6 +615,8 @@ def recover_card(
             body=body,
             shell_key=key,
             acceptance_criteria=acceptance_criteria,
+            workspace_kind=workspace_kind,
+            workspace_path=workspace_path,
             executor_id=executor_id,
             session_id=session_id,
             created_by=created_by,

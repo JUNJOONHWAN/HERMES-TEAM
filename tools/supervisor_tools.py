@@ -1464,6 +1464,12 @@ def _handle_project_cards(args: dict[str, Any], **_kwargs) -> str:
                 body=(str(args.get("body") or "").strip() or None),
                 shell_key=(str(args.get("shell_key") or "").strip() or None),
                 acceptance_criteria=args.get("acceptance_criteria"),
+                workspace_kind=(
+                    str(args.get("workspace_kind") or "").strip() or None
+                ),
+                workspace_path=(
+                    str(args.get("workspace_path") or "").strip() or None
+                ),
                 executor_id=(str(args.get("executor_id") or "").strip() or None),
                 **common,
             )

@@ -622,6 +622,219 @@ def continue_card(
     )
 
 
+def _card_control_result(
+    *,
+    action: str,
+    board: str,
+    task: kb.Task,
+    state: str,
+    control: Optional[dict[str, Any]] = None,
+) -> dict[str, Any]:
+    return {
+        "schema": SCHEMA,
+        "action": action,
+        "board": board,
+        "state": state,
+        "same_card_id": task.id,
+        "card": {
+            "id": task.id,
+            "project_id": task.project_id,
+            "root_task_id": task.root_task_id,
+            "status": task.status,
+            "title": task.title,
+            "worker_pid": task.worker_pid,
+            "block_kind": task.block_kind,
+        },
+        "control": control or {},
+    }
+
+
+def pause_card(
+    card_id: str,
+    *,
+    reason: Optional[str] = None,
+    session_id: Optional[str] = None,
+    created_by: str = "project-card-controller",
+) -> dict[str, Any]:
+    """Stop any active Kanban card and preserve the same card for resume."""
+    del session_id  # accepted for the shared controller call contract
+    located = locate_card(card_id)
+    board = located["board"]
+    source: kb.Task = located["task"]
+    if source.status in {"done", "archived"}:
+        raise ProjectCardControllerError(
+            f"card {source.id} is {source.status} and cannot be paused"
+        )
+
+    pause_reason = str(reason or "operator requested stop").strip()
+    with kb.connect_closing(board=board) as conn:
+        paused = kb.pause_task(
+            conn,
+            source.id,
+            reason=pause_reason,
+            actor=created_by,
+        )
+        if paused is None:
+            current = kb.get_task(conn, source.id)
+            current_status = current.status if current else "missing"
+            current_kind = current.block_kind if current else None
+            raise ProjectCardControllerError(
+                f"card {source.id} could not be paused from "
+                f"status={current_status}, block_kind={current_kind}"
+            )
+        if not paused.get("already_paused"):
+            kb.add_comment(
+                conn,
+                source.id,
+                created_by,
+                "Operator paused this card. The worker was stopped and the "
+                f"same card is waiting for resume. Reason: {pause_reason}",
+            )
+        current = kb.get_task(conn, source.id)
+    if current is None:
+        raise ProjectCardControllerError(
+            f"card {source.id} disappeared after pause"
+        )
+    return _card_control_result(
+        action="pause_card",
+        board=board,
+        task=current,
+        state="paused",
+        control={
+            **paused,
+            "resume_action": "resume_card",
+            "steer_action": "steer_card",
+        },
+    )
+
+
+def resume_card(
+    card_id: str,
+    *,
+    reason: Optional[str] = None,
+    session_id: Optional[str] = None,
+    created_by: str = "project-card-controller",
+) -> dict[str, Any]:
+    """Release an operator-paused card back to the dispatcher."""
+    del session_id
+    located = locate_card(card_id)
+    board = located["board"]
+    with kb.connect_closing(board=board) as conn:
+        source = kb.get_task(conn, str(card_id).strip())
+        if source is None:
+            raise ProjectCardControllerError(f"unknown card: {card_id}")
+        if (
+            source.status != "blocked"
+            or source.block_kind != kb.OPERATOR_PAUSE_BLOCK_KIND
+        ):
+            raise ProjectCardControllerError(
+                f"card {source.id} is not paused by the operator"
+            )
+        if source.worker_pid is not None:
+            raise ProjectCardControllerError(
+                f"card {source.id} worker termination is still pending for "
+                f"PID {source.worker_pid}; resume is not allowed yet"
+            )
+        resume_reason = str(reason or "operator requested continue").strip()
+        kb.add_comment(
+            conn,
+            source.id,
+            created_by,
+            f"Operator resumed this same card. Reason: {resume_reason}",
+        )
+        if not kb.unblock_task(conn, source.id):
+            raise ProjectCardControllerError(
+                f"card {source.id} could not be resumed"
+            )
+        current = kb.get_task(conn, source.id)
+    if current is None:
+        raise ProjectCardControllerError(
+            f"card {source.id} disappeared after resume"
+        )
+    return _card_control_result(
+        action="resume_card",
+        board=board,
+        task=current,
+        state="queued_to_resume",
+        control={
+            "reason": resume_reason,
+            "same_card": True,
+            "prior_attempts_preserved": True,
+            "workspace_preserved": True,
+        },
+    )
+
+
+def steer_card(
+    card_id: str,
+    *,
+    instruction: str,
+    reason: Optional[str] = None,
+    session_id: Optional[str] = None,
+    created_by: str = "project-card-controller",
+) -> dict[str, Any]:
+    """Pause if necessary, add operator guidance, then resume the same card."""
+    guidance = str(instruction or "").strip()
+    if not guidance:
+        raise ProjectCardControllerError("steer instruction is required")
+
+    located = locate_card(card_id)
+    source: kb.Task = located["task"]
+    paused_first = not (
+        source.status == "blocked"
+        and source.block_kind == kb.OPERATOR_PAUSE_BLOCK_KIND
+    )
+    if paused_first:
+        pause_card(
+            source.id,
+            reason=reason or "operator steering",
+            session_id=session_id,
+            created_by=created_by,
+        )
+
+    located = locate_card(source.id)
+    board = located["board"]
+    with kb.connect_closing(board=board) as conn:
+        current = kb.get_task(conn, source.id)
+        if current is None:
+            raise ProjectCardControllerError(f"unknown card: {source.id}")
+        if (
+            current.status != "blocked"
+            or current.block_kind != kb.OPERATOR_PAUSE_BLOCK_KIND
+        ):
+            raise ProjectCardControllerError(
+                f"card {source.id} is not safely paused for steering"
+            )
+        if current.worker_pid is not None:
+            raise ProjectCardControllerError(
+                f"card {source.id} worker termination is still pending for "
+                f"PID {current.worker_pid}; steering resume is not allowed yet"
+            )
+        kb.add_comment(
+            conn,
+            source.id,
+            created_by,
+            "Operator steering for the next run:\n" + guidance,
+        )
+
+    resumed = resume_card(
+        source.id,
+        reason=reason or "operator steering applied",
+        session_id=session_id,
+        created_by=created_by,
+    )
+    resumed["action"] = "steer_card"
+    resumed["state"] = "queued_with_steering"
+    resumed["control"].update(
+        {
+            "instruction": guidance,
+            "paused_first": paused_first,
+            "same_card": True,
+        }
+    )
+    return resumed
+
+
 def request_direction_change(
     card_id: str,
     *,

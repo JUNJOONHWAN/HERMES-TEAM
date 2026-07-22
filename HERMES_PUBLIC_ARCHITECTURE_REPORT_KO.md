@@ -165,6 +165,17 @@ Project를 `paused`로 바꾼다. 운영자가 다음 Telegram/Web UI/CLI 동작
 원본 archived 감사 기록도 삭제하지 않는다. Telegram과 Web UI는 이 동일 컨트롤러
 함수를 호출하고 `p_*`, 원본 `t_*`, checkpoint, `pa_*`를 함께 표시한다.
 
+일반 Kanban `t_*` 카드는 Project 소속 여부와 관계없이 같은 ID로 중지·재개·지시
+변경이 가능하다. `pause_card`는 먼저 카드를 durable `operator_pause` 상태로 옮긴
+뒤 그 카드에 기록된 host-local worker process group만 종료한다. gateway, 다른 카드,
+자동화 정의는 건드리지 않는다. `resume_card`는 종료할 worker PID가 남지 않았을 때만
+같은 `t_*`를 dispatch queue로 되돌리고 새 run attempt를 시작한다.
+
+`steer_card`는 같은 안전 중지를 수행하고 새 지시를 durable comment로 저장한 다음
+같은 `t_*`를 재개한다. 작업자 종료가 확인되지 않으면 카드는 paused 상태를 유지한다.
+다만 Project 카드의 산출물·범위·Role Shell·완료 조건이 달라지는 큰 변경은 이 경로가
+아니라 `request_direction_change`와 별도 `pa_*` 승인을 사용한다.
+
 `pause_project`는 실행 카드가 있을 때 거부하고, 성공하면 active pointer를
 해제하며 모든 새 카드 쓰기를 막는다. `reopen_project`는 명시적 운영자 동작이다.
 따라서 M0/M1 결과가 다음 마일스톤을 제안해도 M2가 자동 발행되는 불도저 구조가

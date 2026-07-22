@@ -124,6 +124,11 @@ VALID_INITIAL_STATUSES = {"running", "blocked"}
 # ``None`` = legacy/un-typed block (treated as a generic human blocker).
 VALID_BLOCK_KINDS = {"dependency", "needs_input", "capability", "transient"}
 
+# Internal control-plane marker for an operator pause.  It deliberately does
+# not belong to VALID_BLOCK_KINDS: workers may report blockers, but only the
+# controller may stop a live card and make it explicitly resumable.
+OPERATOR_PAUSE_BLOCK_KIND = "operator_pause"
+
 # After a task has been blocked, unblocked, and re-blocked this many times for
 # the same (truly-blocked) reason, the unblock-loop breaker stops trusting the
 # unblocker (usually a cron) and routes the task to ``triage`` instead of back
@@ -4156,6 +4161,132 @@ def reclaim_task(
     return True
 
 
+def pause_task(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    reason: Optional[str] = None,
+    actor: str = "operator",
+    signal_fn=None,
+) -> Optional[dict[str, Any]]:
+    """Stop a card's worker and hold the same card for an explicit resume.
+
+    Unlike :func:`reclaim_task`, this never returns the card to ``ready`` where
+    the dispatcher could immediately claim it again.  The database transition
+    to an operator-owned blocked state wins the spawn race first; any recorded
+    host-local worker is then terminated with the same process-group guard used
+    by reclaim/archive.  ``unblock_task`` is the only resume transition.
+
+    Returns a structured result, or ``None`` when the task is terminal or is
+    blocked for a reason other than an existing operator pause.
+    """
+    pause_reason = str(reason or "operator requested stop").strip()
+    pause_actor = str(actor or "operator").strip() or "operator"
+    previous_pid: Optional[int] = None
+    previous_claim_lock: Optional[str] = None
+    paused_run_id: Optional[int] = None
+    status_before: Optional[str] = None
+    already_paused = False
+
+    with write_txn(conn):
+        row = conn.execute(
+            "SELECT status, worker_pid, claim_lock, block_kind "
+            "FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        if row is None or row["status"] in {"done", "archived"}:
+            return None
+        if row["status"] == "blocked" and row["block_kind"] != OPERATOR_PAUSE_BLOCK_KIND:
+            return None
+
+        status_before = str(row["status"])
+        previous_pid = (
+            int(row["worker_pid"]) if row["worker_pid"] is not None else None
+        )
+        previous_claim_lock = row["claim_lock"]
+        already_paused = (
+            status_before == "blocked"
+            and row["block_kind"] == OPERATOR_PAUSE_BLOCK_KIND
+            and previous_pid is None
+        )
+        if not already_paused:
+            cur = conn.execute(
+                "UPDATE tasks SET status = 'blocked', "
+                "claim_lock = NULL, claim_expires = NULL, worker_pid = NULL, "
+                "block_kind = ? "
+                "WHERE id = ? AND status = ? AND claim_lock IS ?",
+                (
+                    OPERATOR_PAUSE_BLOCK_KIND,
+                    task_id,
+                    status_before,
+                    previous_claim_lock,
+                ),
+            )
+            if cur.rowcount != 1:
+                return None
+            paused_run_id = _end_run(
+                conn,
+                task_id,
+                outcome="reclaimed",
+                status="reclaimed",
+                summary=f"operator pause: {pause_reason}",
+            )
+            _append_event(
+                conn,
+                task_id,
+                "paused_by_operator",
+                {
+                    "actor": pause_actor,
+                    "reason": pause_reason,
+                    "status_before": status_before,
+                    "previous_worker_pid": previous_pid,
+                },
+                run_id=paused_run_id,
+            )
+
+    termination = _terminate_reclaimed_worker(
+        previous_pid,
+        previous_claim_lock,
+        signal_fn=signal_fn,
+    )
+    if previous_pid is not None:
+        with write_txn(conn):
+            if not termination.get("terminated"):
+                # Keep a cleanup handle and refuse resume until the owning host
+                # confirms the old worker is gone.
+                conn.execute(
+                    "UPDATE tasks SET worker_pid = ?, claim_lock = ? "
+                    "WHERE id = ? AND status = 'blocked' "
+                    "AND block_kind = ? AND worker_pid IS NULL",
+                    (
+                        previous_pid,
+                        previous_claim_lock,
+                        task_id,
+                        OPERATOR_PAUSE_BLOCK_KIND,
+                    ),
+                )
+            _append_event(
+                conn,
+                task_id,
+                "pause_worker_termination",
+                termination,
+                run_id=paused_run_id,
+            )
+
+    return {
+        "task_id": task_id,
+        "status_before": status_before,
+        "status": "blocked",
+        "pause_kind": OPERATOR_PAUSE_BLOCK_KIND,
+        "already_paused": already_paused,
+        "run_id": paused_run_id,
+        "termination": termination,
+        "termination_pending": bool(
+            previous_pid is not None and not termination.get("terminated")
+        ),
+    }
+
+
 def reassign_task(
     conn: sqlite3.Connection,
     task_id: str,
@@ -5334,9 +5465,10 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
         # start for the dispatcher's retry budget.
         cur = conn.execute(
             "UPDATE tasks SET status = ?, current_run_id = NULL, "
-            "consecutive_failures = 0, last_failure_error = NULL "
+            "consecutive_failures = 0, last_failure_error = NULL, "
+            "block_kind = CASE WHEN block_kind = ? THEN NULL ELSE block_kind END "
             "WHERE id = ? AND status IN ('blocked', 'scheduled')",
-            (new_status, task_id),
+            (new_status, OPERATOR_PAUSE_BLOCK_KIND, task_id),
         )
         if cur.rowcount != 1:
             return False

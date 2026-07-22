@@ -489,6 +489,88 @@ def test_direction_change_stops_source_and_waits_for_successor_approval(
     assert controller.inspect_project(project_id)["project"]["status"] == "active"
 
 
+def test_generic_card_pause_resume_and_steer_reuse_same_card(
+    project_control_home,
+):
+    with kb.connect_closing(board="default") as conn:
+        card_id = kb.create_task(
+            conn,
+            title="Ordinary resumable card",
+            body="Keep the original work visible.",
+            assignee="worker",
+        )
+
+    paused = controller.pause_card(
+        card_id,
+        reason="operator requested stop",
+        created_by="test-operator",
+    )
+    assert paused["same_card_id"] == card_id
+    assert paused["state"] == "paused"
+    assert paused["card"]["status"] == "blocked"
+    assert paused["card"]["block_kind"] == kb.OPERATOR_PAUSE_BLOCK_KIND
+
+    resumed = controller.resume_card(
+        card_id,
+        reason="continue the original work",
+        created_by="test-operator",
+    )
+    assert resumed["same_card_id"] == card_id
+    assert resumed["state"] == "queued_to_resume"
+    assert resumed["card"]["status"] == "ready"
+    assert resumed["card"]["block_kind"] is None
+
+    steered = controller.steer_card(
+        card_id,
+        instruction="Verify source B before drawing the conclusion.",
+        created_by="test-operator",
+    )
+    assert steered["same_card_id"] == card_id
+    assert steered["state"] == "queued_with_steering"
+    assert steered["card"]["status"] == "ready"
+    assert steered["control"]["paused_first"] is True
+    with kb.connect_closing(board="default") as conn:
+        context = kb.build_worker_context(conn, card_id)
+    assert "Verify source B before drawing the conclusion." in context
+    assert "Operator steering for the next run" in context
+
+
+def test_supervisor_handler_controls_generic_card_without_project(
+    project_control_home,
+):
+    with kb.connect_closing(board="default") as conn:
+        card_id = kb.create_task(
+            conn,
+            title="Controller ordinary card",
+            assignee="worker",
+        )
+
+    paused = json.loads(
+        supervisor_tools._handle_project_cards(
+            {
+                "action": "pause_card",
+                "card_id": card_id,
+                "reason": "stop now",
+            }
+        )
+    )
+    assert paused["action"] == "pause_card"
+    assert paused["same_card_id"] == card_id
+
+    steered = json.loads(
+        supervisor_tools._handle_project_cards(
+            {
+                "action": "steer_card",
+                "card_id": card_id,
+                "instruction": "Use the corrected acceptance check.",
+            }
+        )
+    )
+    assert steered["action"] == "steer_card"
+    assert steered["same_card_id"] == card_id
+    assert steered["card"]["status"] == "ready"
+
+
 def test_direction_change_waits_for_confirmed_worker_termination(
     project_control_home,
 ):

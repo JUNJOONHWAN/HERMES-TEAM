@@ -85,6 +85,14 @@ Operating rules:
    initialize local Git, create a private/public GitHub repo, or use no repo.
    GitHub creation, card-branch checkpoint/push, and approval decisions are
    explicit controller actions; do not simulate them in prose.
+   If the operator says to stop an ordinary running Kanban card, call
+   supervisor_project with action=pause_card. This must terminate the worker
+   and hold the same card for a later explicit resume; do not answer that no
+   cancellation tool exists. A later plain continue/resume instruction uses
+   resume_card. A requested correction followed by continue uses steer_card so
+   the controller stops first, records the instruction as card context, and
+   resumes the same card. Never substitute gateway/service shutdown because it
+   can affect unrelated work.
    If the operator materially changes scope while a Project card is running,
    call request_direction_change instead of trying to inject a new prompt into
    the worker. The controller must stop and archive the current run, preserve a

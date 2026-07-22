@@ -13,7 +13,7 @@ OpenAI-compatible endpoints, and generic CLIs are optional adapters.
 
 | Layer | Version |
 |---|---|
-| Hermes distribution family | `0.1.5` |
+| Hermes distribution family | `0.1.6` |
 | Hermes Agent engine | `0.18.0` |
 
 HERMES-CONTROL must use the same distribution version while retaining the separate engine version.
@@ -72,6 +72,10 @@ execution adapters:
   archives the current worker, checkpoints its Git worktree, and creates only
   a `pa_*` successor draft. The replacement `t_*` card is linked to the
   preserved source and cannot exist or dispatch before separate approval.
+- **Resumable ordinary-card control:** an operator can pause any nonterminal
+  Kanban card without stopping the gateway or another executor. The worker is
+  terminated, the same `t_*` stays held, and a later resume or steer reuses its
+  workspace, attempt history, and comment context.
 - **Separate Project DB:** milestone, phase, card counts, pending approvals,
   repository identity, commit SHA, push receipt, and Git events survive apart
   from the Kanban execution ledger.

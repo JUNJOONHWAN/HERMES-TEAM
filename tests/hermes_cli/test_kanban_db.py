@@ -1820,6 +1820,51 @@ def test_archive_running_task_terminates_worker_and_closes_run(
     assert "archive_worker_termination" in event_kinds
 
 
+def test_pause_running_task_terminates_worker_and_holds_same_card(
+    kanban_home, monkeypatch,
+):
+    signals = []
+    monkeypatch.setattr(kb, "_pid_alive", lambda _pid: False)
+
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="pause running", assignee="worker")
+        claimed = kb.claim_task(conn, tid)
+        assert claimed is not None
+        assert kb._set_worker_pid(
+            conn,
+            tid,
+            525252,
+            expected_run_id=claimed.current_run_id,
+        )
+
+        paused = kb.pause_task(
+            conn,
+            tid,
+            reason="operator said stop",
+            actor="test-operator",
+            signal_fn=lambda pid, sig: signals.append((pid, sig)),
+        )
+        task = kb.get_task(conn, tid)
+        run = conn.execute(
+            "SELECT status,outcome,ended_at FROM task_runs WHERE id=?",
+            (claimed.current_run_id,),
+        ).fetchone()
+        event_kinds = [event.kind for event in kb.list_events(conn, tid)]
+
+    assert paused is not None
+    assert paused["termination_pending"] is False
+    assert task.id == tid
+    assert task.status == "blocked"
+    assert task.block_kind == kb.OPERATOR_PAUSE_BLOCK_KIND
+    assert task.worker_pid is None
+    assert signals and signals[0][0] == 525252
+    assert run["status"] == "reclaimed"
+    assert run["outcome"] == "reclaimed"
+    assert run["ended_at"] is not None
+    assert "paused_by_operator" in event_kinds
+    assert "pause_worker_termination" in event_kinds
+
+
 def test_worker_termination_signals_spawned_process_group(monkeypatch):
     signals = []
 

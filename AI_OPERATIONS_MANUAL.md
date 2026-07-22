@@ -33,6 +33,10 @@ heartbeat configuration.
 15. A material mid-card direction change is never live prompt injection. Stop
     and archive the source, checkpoint it, create a `pa_*` successor proposal,
     and wait for a later explicit operator approval.
+16. An ordinary-card `pause_card`, `resume_card`, or `steer_card` action keeps
+    the same `t_*` identity. It may terminate only that card's host-local worker
+    process group; it must not stop the gateway, another executor, or an
+    automation definition.
 
 ## 0.1 Maintainer release boundary
 
@@ -182,6 +186,26 @@ Telegram notifications and the dashboard must render both `Project: p_*` and
 `Card: t_*`. A new notification subscription starts at the current event
 cursor; terminal/archived subscriptions are removed so old failures cannot be
 replayed as a notification storm.
+
+## 3.2 Ordinary-card pause, resume, and steer
+
+For any nonterminal Kanban `t_*` card, including a card with no Project, map an
+operator's plain `stop` or `중지` request to `pause_card`. The DB transition to
+the durable `operator_pause` block happens before worker termination. Only the
+host-local process group recorded for that card may be terminated; the gateway,
+other cards, and automation definitions stay running.
+
+Map `continue`, `resume`, `계속`, or `재개` to `resume_card`. Resume is allowed
+only while the card is held by `operator_pause` and no worker PID remains. It
+returns the same card ID to the dispatch queue and starts a new run attempt; it
+does not resurrect the old OS process.
+
+Map a correction plus continuation to `steer_card`. It pauses the card, writes
+the new instruction as a durable comment for the next run, and resumes the same
+card ID. If termination cannot be confirmed, leave the card paused and report
+`worker termination pending`. Material Project scope, Role Shell, deliverable,
+or acceptance-criteria changes still require `request_direction_change` and a
+separate `pa_*` approval.
 
 ## 4. Add or revise a Role Shell
 

@@ -1,5 +1,5 @@
 {
   "schema": "hermes.distribution-release.v1",
-  "distribution_version": "0.1.5",
+  "distribution_version": "0.1.6",
   "engine_version": "0.18.0"
 }

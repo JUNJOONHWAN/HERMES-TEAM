@@ -1450,6 +1450,25 @@ def _handle_project_cards(args: dict[str, Any], **_kwargs) -> str:
                 milestone=(str(args.get("milestone") or "").strip() or None),
                 **common,
             )
+        elif action == "pause_card":
+            result = project_cards.pause_card(
+                str(args.get("card_id") or ""),
+                reason=(str(args.get("reason") or "").strip() or None),
+                **common,
+            )
+        elif action == "resume_card":
+            result = project_cards.resume_card(
+                str(args.get("card_id") or ""),
+                reason=(str(args.get("reason") or "").strip() or None),
+                **common,
+            )
+        elif action == "steer_card":
+            result = project_cards.steer_card(
+                str(args.get("card_id") or ""),
+                instruction=str(args.get("instruction") or ""),
+                reason=(str(args.get("reason") or "").strip() or None),
+                **common,
+            )
         elif action == "request_direction_change":
             result = project_cards.request_direction_change(
                 str(args.get("card_id") or ""),
@@ -2053,7 +2072,9 @@ SUPERVISOR_PROJECT_SCHEMA = {
         "Native deterministic Project/Card Controller. Use it for long-lived "
         "team projects and card chains: start a project, add an independent "
         "root card inside it, continue a completed or active card with a "
-        "follow-up, stop/checkpoint a card and request an approved direction-change "
+        "follow-up, pause/resume any ordinary Kanban card, steer a safely "
+        "paused ordinary card on the same id, stop/checkpoint a Project card "
+        "and request an approved direction-change "
         "successor, split work into parallel role cards, "
         "create an independent verification card, recover failed work through "
         "another compatible adapter, inspect/locate old cards, configure a "
@@ -2075,6 +2096,9 @@ SUPERVISOR_PROJECT_SCHEMA = {
                     "start_project",
                     "add_project_card",
                     "continue_card",
+                    "pause_card",
+                    "resume_card",
+                    "steer_card",
                     "request_direction_change",
                     "split_card",
                     "verify_card",
@@ -2101,6 +2125,14 @@ SUPERVISOR_PROJECT_SCHEMA = {
             "approval_id": {"type": "string"},
             "title": {"type": "string"},
             "body": {"type": "string"},
+            "instruction": {
+                "type": "string",
+                "description": (
+                    "Required for steer_card. The operator guidance is stored "
+                    "as a card comment, then the same card is resumed so the "
+                    "next run receives it with prior attempts and workspace."
+                ),
+            },
             "shell_key": {
                 "type": "string",
                 "description": (

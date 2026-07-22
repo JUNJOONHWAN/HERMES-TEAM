@@ -280,13 +280,14 @@ TOOLSETS = {
     "supervisor": {
         "description": (
             "Lightweight Hermes control-tower tools for deterministic health "
-            "inspection, role-shell discovery, and delegation. These tools do "
-            "not perform domain work."
+            "inspection, project/card lifecycle, role-shell discovery, and "
+            "delegation. These tools do not perform domain work."
         ),
         "tools": [
             "supervisor_status",
             "supervisor_roles",
             "supervisor_delegate",
+            "supervisor_project",
         ],
         "includes": [],
     },

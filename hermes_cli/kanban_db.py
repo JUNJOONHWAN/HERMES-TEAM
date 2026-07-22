@@ -133,6 +133,14 @@ VALID_BLOCK_KINDS = {"dependency", "needs_input", "capability", "transient"}
 # not dispatcher spawn/crash/timeout failures.
 BLOCK_RECURRENCE_LIMIT = 2
 VALID_WORKSPACE_KINDS = {"scratch", "worktree", "dir"}
+VALID_TASK_LINK_TYPES = {
+    "depends_on",
+    "follows",
+    "reviews",
+    "recovers",
+    "references",
+}
+BLOCKING_TASK_LINK_TYPES = frozenset({"depends_on", "follows", "reviews"})
 KNOWN_TOOLSET_NAMES = frozenset(name.casefold() for name in get_toolset_names())
 _IS_WINDOWS = sys.platform == "win32"
 
@@ -856,6 +864,13 @@ class Task:
     tenant: Optional[str]
     branch_name: Optional[str] = None
     project_id: Optional[str] = None
+    # Stable identity of the root card in a long-lived card thread. New root
+    # cards point to themselves; descendants inherit their parent's root.
+    root_task_id: Optional[str] = None
+    # Per-card acceptance and explicit inputs are stored as JSON arrays. The
+    # immutable Role Shell still owns the general receipt/evidence contract.
+    acceptance_criteria: list[str] = field(default_factory=list)
+    input_refs: list[str] = field(default_factory=list)
     result: Optional[str] = None
     idempotency_key: Optional[str] = None
     # Unified non-success counter. Incremented on any of:
@@ -930,6 +945,20 @@ class Task:
                     skills_value = [str(s) for s in parsed if s]
             except Exception:
                 skills_value = None
+        acceptance_criteria: list[str] = []
+        input_refs: list[str] = []
+        for column, target in (
+            ("acceptance_criteria", acceptance_criteria),
+            ("input_refs", input_refs),
+        ):
+            if column not in keys or not row[column]:
+                continue
+            try:
+                parsed = json.loads(row[column])
+            except Exception:
+                continue
+            if isinstance(parsed, list):
+                target.extend(str(item) for item in parsed if str(item).strip())
         return cls(
             id=row["id"],
             title=row["title"],
@@ -945,6 +974,13 @@ class Task:
             workspace_path=row["workspace_path"],
             branch_name=row["branch_name"] if "branch_name" in keys else None,
             project_id=row["project_id"] if "project_id" in keys else None,
+            root_task_id=(
+                row["root_task_id"]
+                if "root_task_id" in keys and row["root_task_id"]
+                else row["id"]
+            ),
+            acceptance_criteria=acceptance_criteria,
+            input_refs=input_refs,
             claim_lock=row["claim_lock"],
             claim_expires=row["claim_expires"],
             tenant=row["tenant"] if "tenant" in keys else None,
@@ -1135,6 +1171,12 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- the task's worktree is anchored under the project's primary repo with a
     -- deterministic branch name instead of a random wt/<task-id> fallback.
     project_id           TEXT,
+    -- Stable root of the card thread. Roots point to themselves; every
+    -- follow-up, split, review, and recovery card inherits the same value.
+    root_task_id         TEXT,
+    -- Explicit per-card completion checks and input references as JSON arrays.
+    acceptance_criteria  TEXT,
+    input_refs           TEXT,
     claim_lock           TEXT,
     claim_expires        INTEGER,
     tenant               TEXT,
@@ -1205,6 +1247,9 @@ CREATE TABLE IF NOT EXISTS tasks (
 CREATE TABLE IF NOT EXISTS task_links (
     parent_id  TEXT NOT NULL,
     child_id   TEXT NOT NULL,
+    -- Blocking: depends_on, follows, reviews. Non-blocking lineage:
+    -- recovers, references. Legacy rows migrate to depends_on.
+    relation_type TEXT NOT NULL DEFAULT 'depends_on',
     PRIMARY KEY (parent_id, child_id)
 );
 
@@ -1888,6 +1933,19 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
         _add_column_if_missing(conn, "tasks", "branch_name", "branch_name TEXT")
     if "project_id" not in cols:
         _add_column_if_missing(conn, "tasks", "project_id", "project_id TEXT")
+    if "root_task_id" not in cols:
+        _add_column_if_missing(conn, "tasks", "root_task_id", "root_task_id TEXT")
+        # Existing cards predate explicit threads. Preserve them as independent
+        # roots rather than guessing across historical dependency graphs.
+        conn.execute(
+            "UPDATE tasks SET root_task_id = id WHERE root_task_id IS NULL"
+        )
+    if "acceptance_criteria" not in cols:
+        _add_column_if_missing(
+            conn, "tasks", "acceptance_criteria", "acceptance_criteria TEXT"
+        )
+    if "input_refs" not in cols:
+        _add_column_if_missing(conn, "tasks", "input_refs", "input_refs TEXT")
     if "idempotency_key" not in cols:
         _add_column_if_missing(
             conn, "tasks", "idempotency_key", "idempotency_key TEXT"
@@ -1895,6 +1953,22 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
     # ``idx_tasks_idempotency`` is created unconditionally below alongside
     # the other additive-column indexes — see the block after the
     # legacy-column migration. Creating it here too would be redundant.
+
+    link_table_exists = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='task_links'"
+    ).fetchone() is not None
+    link_cols = (
+        {row["name"] for row in conn.execute("PRAGMA table_info(task_links)")}
+        if link_table_exists
+        else set()
+    )
+    if link_table_exists and "relation_type" not in link_cols:
+        _add_column_if_missing(
+            conn,
+            "task_links",
+            "relation_type",
+            "relation_type TEXT NOT NULL DEFAULT 'depends_on'",
+        )
 
     # Refresh after early additive migrations above. Some existing DBs were
     # partially migrated in older releases and can already contain the later
@@ -2025,6 +2099,19 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_tasks_session_id ON tasks(session_id)"
     )
+    current_task_cols = {
+        row["name"] for row in conn.execute("PRAGMA table_info(tasks)")
+    }
+    if {"project_id", "root_task_id", "status"}.issubset(current_task_cols):
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_tasks_project_root "
+            "ON tasks(project_id, root_task_id, status)"
+        )
+    if link_table_exists:
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_links_relation "
+            "ON task_links(relation_type, child_id)"
+        )
 
     # task_events gained a run_id column; back-fill it as NULL for
     # historical events (they predate runs and can't be attributed).
@@ -2443,6 +2530,11 @@ def create_task(
     session_id: Optional[str] = None,
     board: Optional[str] = None,
     project_id: Optional[str] = None,
+    use_project_workspace: bool = True,
+    root_task_id: Optional[str] = None,
+    acceptance_criteria: Optional[Iterable[str]] = None,
+    input_refs: Optional[Iterable[str]] = None,
+    parent_link_type: str = "depends_on",
     role_shell_id: Optional[str] = None,
     adapter_executor_id: Optional[str] = None,
     adapter_override_mode: str = "once",
@@ -2519,6 +2611,24 @@ def create_task(
         branch_name = str(branch_name).strip() or None
     if branch_name and workspace_kind != "worktree":
         raise ValueError("branch_name is only valid for worktree workspaces")
+    parent_link_type = str(parent_link_type or "depends_on").strip().lower()
+    if parent_link_type not in VALID_TASK_LINK_TYPES:
+        raise ValueError(
+            f"parent_link_type must be one of {sorted(VALID_TASK_LINK_TYPES)}"
+        )
+
+    def _clean_string_list(values: Optional[Iterable[str]]) -> list[str]:
+        cleaned: list[str] = []
+        seen: set[str] = set()
+        for value in values or ():
+            item = str(value or "").strip()
+            if item and item not in seen:
+                seen.add(item)
+                cleaned.append(item)
+        return cleaned
+
+    acceptance_list = _clean_string_list(acceptance_criteria)
+    input_ref_list = _clean_string_list(input_refs)
 
     # Resolve an optional first-class Project link. A project-linked task is
     # anchored to the project's primary repo as a git worktree, so its branch
@@ -2550,10 +2660,15 @@ def create_task(
             # Canonicalise (a slug may have been passed) and anchor the
             # worktree under the project's primary repo.
             project_id = project_obj.id
-            if workspace_kind == "scratch" and project_obj.primary_path:
+            if (
+                use_project_workspace
+                and workspace_kind == "scratch"
+                and project_obj.primary_path
+            ):
                 workspace_kind = "worktree"
             if (
-                workspace_kind == "worktree"
+                use_project_workspace
+                and workspace_kind == "worktree"
                 and workspace_path is None
                 and project_obj.primary_path
             ):
@@ -2561,7 +2676,27 @@ def create_task(
                 # ``<repo>/.worktrees/<task-id>`` dir keyed on the new task id.
                 project_repo = str(project_obj.primary_path)
 
-    parents = tuple(p for p in parents if p)
+    parents = tuple(dict.fromkeys(str(p).strip() for p in parents if str(p).strip()))
+    root_task_id = str(root_task_id or "").strip() or None
+    if root_task_id:
+        root_row = conn.execute(
+            "SELECT id, root_task_id, project_id FROM tasks WHERE id = ?",
+            (root_task_id,),
+        ).fetchone()
+        if root_row is None:
+            raise ValueError(f"unknown root task: {root_task_id}")
+        root_task_id = root_row["root_task_id"] or root_row["id"]
+        if project_id and root_row["project_id"] not in {None, project_id}:
+            raise ValueError("root task belongs to a different project")
+    elif parents:
+        parent_root = conn.execute(
+            "SELECT id, root_task_id, project_id FROM tasks WHERE id = ?",
+            (parents[0],),
+        ).fetchone()
+        if parent_root is not None:
+            root_task_id = parent_root["root_task_id"] or parent_root["id"]
+            if project_id and parent_root["project_id"] not in {None, project_id}:
+                raise ValueError("parent task belongs to a different project")
 
     # Normalise + validate skills: strip whitespace, drop empties, dedupe
     # (preserving order). Refuse commas inside a single name so we don't
@@ -2667,14 +2802,15 @@ def create_task(
                         missing = _find_missing_parents(conn, parents)
                         if missing:
                             raise ValueError(f"unknown parent task(s): {', '.join(missing)}")
-                        # If any parent is not yet done, we're todo.
-                        rows = conn.execute(
-                            "SELECT status FROM tasks WHERE id IN "
-                            "(" + ",".join("?" * len(parents)) + ")",
-                            parents,
-                        ).fetchall()
-                        if any(r["status"] != "done" for r in rows):
-                            task_status = "todo"
+                        if parent_link_type in BLOCKING_TASK_LINK_TYPES:
+                            # Blocking semantic relations wait for all parents.
+                            rows = conn.execute(
+                                "SELECT status FROM tasks WHERE id IN "
+                                "(" + ",".join("?" * len(parents)) + ")",
+                                parents,
+                            ).fetchall()
+                            if any(r["status"] != "done" for r in rows):
+                                task_status = "todo"
                 # Even in triage mode we still need to validate parent ids
                 # so the eventual link rows don't dangle.
                 if triage and parents:
@@ -2700,16 +2836,19 @@ def create_task(
                         except Exception:
                             branch_name = None
 
+                effective_root_task_id = root_task_id or task_id
+
                 conn.execute(
                     """
                     INSERT INTO tasks (
                         id, title, body, assignee, status, priority,
                         created_by, created_at, workspace_kind, workspace_path,
-                        branch_name, project_id, tenant, idempotency_key,
+                        branch_name, project_id, root_task_id,
+                        acceptance_criteria, input_refs, tenant, idempotency_key,
                         max_runtime_seconds,
                         skills, max_retries, goal_mode, goal_max_turns, session_id,
                         role_shell_id
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id,
@@ -2724,6 +2863,9 @@ def create_task(
                         workspace_path,
                         branch_name,
                         project_id,
+                        effective_root_task_id,
+                        json.dumps(acceptance_list, ensure_ascii=False),
+                        json.dumps(input_ref_list, ensure_ascii=False),
                         tenant,
                         idempotency_key,
                         int(max_runtime_seconds) if max_runtime_seconds is not None else None,
@@ -2737,8 +2879,9 @@ def create_task(
                 )
                 for pid in parents:
                     conn.execute(
-                        "INSERT OR IGNORE INTO task_links (parent_id, child_id) VALUES (?, ?)",
-                        (pid, task_id),
+                        "INSERT OR IGNORE INTO task_links "
+                        "(parent_id, child_id, relation_type) VALUES (?, ?, ?)",
+                        (pid, task_id, parent_link_type),
                     )
                 adapter_override_id = None
                 if adapter_executor is not None:
@@ -2768,6 +2911,11 @@ def create_task(
                         ),
                         "status": task_status,
                         "parents": list(parents),
+                        "parent_link_type": parent_link_type if parents else None,
+                        "project_id": project_id,
+                        "root_task_id": effective_root_task_id,
+                        "acceptance_criteria": acceptance_list,
+                        "input_refs": input_ref_list,
                         "tenant": tenant,
                         "branch_name": branch_name,
                         "skills": list(skills_list) if skills_list else None,
@@ -2904,7 +3052,18 @@ def assign_task(conn: sqlite3.Connection, task_id: str, profile: Optional[str]) 
 # Links
 # ---------------------------------------------------------------------------
 
-def link_tasks(conn: sqlite3.Connection, parent_id: str, child_id: str) -> None:
+def link_tasks(
+    conn: sqlite3.Connection,
+    parent_id: str,
+    child_id: str,
+    *,
+    relation_type: str = "depends_on",
+) -> None:
+    relation_type = str(relation_type or "depends_on").strip().lower()
+    if relation_type not in VALID_TASK_LINK_TYPES:
+        raise ValueError(
+            f"relation_type must be one of {sorted(VALID_TASK_LINK_TYPES)}"
+        )
     if parent_id == child_id:
         raise ValueError("a task cannot depend on itself")
     with write_txn(conn):
@@ -2916,22 +3075,34 @@ def link_tasks(conn: sqlite3.Connection, parent_id: str, child_id: str) -> None:
                 f"linking {parent_id} -> {child_id} would create a cycle"
             )
         conn.execute(
-            "INSERT OR IGNORE INTO task_links (parent_id, child_id) VALUES (?, ?)",
-            (parent_id, child_id),
+            "INSERT INTO task_links (parent_id, child_id, relation_type) "
+            "VALUES (?, ?, ?) "
+            "ON CONFLICT(parent_id, child_id) DO UPDATE SET "
+            "relation_type = excluded.relation_type",
+            (parent_id, child_id, relation_type),
         )
-        # If child was ready but parent is not yet done, demote child to todo.
+        # Blocking semantic links gate readiness; recovery/reference links are
+        # auditable lineage only and must never park a rescue card in todo.
         parent_status = conn.execute(
             "SELECT status FROM tasks WHERE id = ?", (parent_id,)
         ).fetchone()["status"]
-        if parent_status != "done":
+        if relation_type in BLOCKING_TASK_LINK_TYPES and parent_status != "done":
             conn.execute(
                 "UPDATE tasks SET status = 'todo' WHERE id = ? AND status = 'ready'",
                 (child_id,),
             )
         _append_event(
             conn, child_id, "linked",
-            {"parent": parent_id, "child": child_id},
+            {
+                "parent": parent_id,
+                "child": child_id,
+                "relation_type": relation_type,
+                "blocking": relation_type in BLOCKING_TASK_LINK_TYPES,
+            },
         )
+    if relation_type not in BLOCKING_TASK_LINK_TYPES:
+        # A prior blocking link may have been retyped as semantic-only.
+        recompute_ready(conn)
 
 
 def _would_cycle(conn: sqlite3.Connection, parent_id: str, child_id: str) -> bool:
@@ -2992,6 +3163,38 @@ def child_ids(conn: sqlite3.Connection, task_id: str) -> list[str]:
         (task_id,),
     ).fetchall()
     return [r["child_id"] for r in rows]
+
+
+def task_link_details(
+    conn: sqlite3.Connection,
+    task_id: str,
+) -> dict[str, list[dict[str, Any]]]:
+    """Return typed incoming and outgoing card relations."""
+    incoming = [
+        {
+            "task_id": row["parent_id"],
+            "relation_type": row["relation_type"],
+            "blocking": row["relation_type"] in BLOCKING_TASK_LINK_TYPES,
+        }
+        for row in conn.execute(
+            "SELECT parent_id, relation_type FROM task_links "
+            "WHERE child_id = ? ORDER BY parent_id",
+            (task_id,),
+        ).fetchall()
+    ]
+    outgoing = [
+        {
+            "task_id": row["child_id"],
+            "relation_type": row["relation_type"],
+            "blocking": row["relation_type"] in BLOCKING_TASK_LINK_TYPES,
+        }
+        for row in conn.execute(
+            "SELECT child_id, relation_type FROM task_links "
+            "WHERE parent_id = ? ORDER BY child_id",
+            (task_id,),
+        ).fetchall()
+    ]
+    return {"incoming": incoming, "outgoing": outgoing}
 
 
 def parent_results(conn: sqlite3.Connection, task_id: str) -> list[tuple[str, Optional[str]]]:
@@ -3423,7 +3626,8 @@ def recompute_ready(
             parents = conn.execute(
                 "SELECT t.status FROM tasks t "
                 "JOIN task_links l ON l.parent_id = t.id "
-                "WHERE l.child_id = ?",
+                "WHERE l.child_id = ? "
+                "AND l.relation_type IN ('depends_on', 'follows', 'reviews')",
                 (task_id,),
             ).fetchall()
             if all(p["status"] in ("done", "archived") for p in parents):
@@ -3491,7 +3695,9 @@ def claim_task(
         undone = conn.execute(
             "SELECT 1 FROM task_links l "
             "JOIN tasks p ON p.id = l.parent_id "
-            "WHERE l.child_id = ? AND p.status NOT IN ('done', 'archived') LIMIT 1",
+            "WHERE l.child_id = ? "
+            "AND l.relation_type IN ('depends_on', 'follows', 'reviews') "
+            "AND p.status NOT IN ('done', 'archived') LIMIT 1",
             (task_id,),
         ).fetchone()
         if undone:
@@ -5038,7 +5244,8 @@ def promote_task(
         parents = conn.execute(
             "SELECT t.id, t.status FROM tasks t "
             "JOIN task_links l ON l.parent_id = t.id "
-            "WHERE l.child_id = ?",
+            "WHERE l.child_id = ? "
+            "AND l.relation_type IN ('depends_on', 'follows', 'reviews')",
             (task_id,),
         ).fetchall()
         unsatisfied = [
@@ -5109,7 +5316,9 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
         undone_parents = conn.execute(
             "SELECT 1 FROM task_links l "
             "JOIN tasks p ON p.id = l.parent_id "
-            "WHERE l.child_id = ? AND p.status != 'done' LIMIT 1",
+            "WHERE l.child_id = ? "
+            "AND l.relation_type IN ('depends_on', 'follows', 'reviews') "
+            "AND p.status NOT IN ('done', 'archived') LIMIT 1",
             (task_id,),
         ).fetchone()
         new_status = "todo" if undone_parents else "ready"

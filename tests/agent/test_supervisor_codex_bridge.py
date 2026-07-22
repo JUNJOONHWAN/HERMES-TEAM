@@ -56,6 +56,7 @@ def test_context_injects_fixed_identity_control_tools_and_no_mcp(monkeypatch):
         "supervisor_automation",
         "supervisor_roles",
         "supervisor_delegate",
+        "supervisor_project",
         "supervisor_adapter",
     ]
     assert all(tool["type"] == "function" for tool in context.dynamic_tools)

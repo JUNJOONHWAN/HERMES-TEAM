@@ -14,6 +14,7 @@ from typing import Any
 
 from hermes_constants import get_hermes_home
 from hermes_cli import kanban_db as kb
+from hermes_cli import project_card_controller as project_cards
 from hermes_cli import supervisor_registry as registry
 from hermes_cli.config import load_config
 from hermes_cli.supervisor_tool_catalog import (
@@ -1373,6 +1374,143 @@ def _handle_delegate(args: dict[str, Any], **_kwargs) -> str:
         return tool_error(f"supervisor_delegate: {exc}")
 
 
+def _handle_project_cards(args: dict[str, Any], **_kwargs) -> str:
+    """Deterministic Project/Card Controller shared by chat and web.
+
+    The root model may translate a user's request into this strict schema, but
+    it cannot directly write project/card state. No worker adapter is invoked
+    here; adapters are selected only when the resulting card is dispatched.
+    """
+    action = str(args.get("action") or "list_projects").strip().lower()
+    session_id = str(_kwargs.get("session_id") or "").strip() or None
+    common = {
+        "session_id": session_id,
+        "created_by": "hermes-project-card-controller",
+    }
+    try:
+        if action == "list_projects":
+            result = project_cards.list_projects(
+                include_archived=bool(args.get("include_archived", False))
+            )
+        elif action == "start_project":
+            result = project_cards.start_project(
+                name=str(args.get("project_name") or ""),
+                slug=(str(args.get("project_slug") or "").strip() or None),
+                description=(str(args.get("body") or "").strip() or None),
+                primary_path=(str(args.get("primary_path") or "").strip() or None),
+                board=str(args.get("board") or kb.DEFAULT_BOARD),
+                goal=str(args.get("title") or ""),
+                shell_key=str(args.get("shell_key") or ""),
+                acceptance_criteria=args.get("acceptance_criteria"),
+                input_refs=args.get("input_refs"),
+                priority=int(args.get("priority") or 0),
+                executor_id=(str(args.get("executor_id") or "").strip() or None),
+                **common,
+            )
+        elif action == "continue_card":
+            result = project_cards.continue_card(
+                str(args.get("card_id") or ""),
+                title=str(args.get("title") or ""),
+                body=(str(args.get("body") or "").strip() or None),
+                shell_key=(str(args.get("shell_key") or "").strip() or None),
+                acceptance_criteria=args.get("acceptance_criteria"),
+                input_refs=args.get("input_refs"),
+                workspace_kind=(
+                    str(args.get("workspace_kind") or "").strip() or None
+                ),
+                workspace_path=(
+                    str(args.get("workspace_path") or "").strip() or None
+                ),
+                priority=int(args.get("priority") or 0),
+                executor_id=(str(args.get("executor_id") or "").strip() or None),
+                **common,
+            )
+        elif action == "split_card":
+            result = project_cards.split_card(
+                str(args.get("card_id") or ""),
+                cards=args.get("cards") or [],
+                **common,
+            )
+        elif action == "verify_card":
+            result = project_cards.verify_card(
+                str(args.get("card_id") or ""),
+                title=(str(args.get("title") or "").strip() or None),
+                body=(str(args.get("body") or "").strip() or None),
+                acceptance_criteria=args.get("acceptance_criteria"),
+                **common,
+            )
+        elif action == "recover_card":
+            result = project_cards.recover_card(
+                str(args.get("card_id") or ""),
+                title=(str(args.get("title") or "").strip() or None),
+                body=(str(args.get("body") or "").strip() or None),
+                shell_key=(str(args.get("shell_key") or "").strip() or None),
+                acceptance_criteria=args.get("acceptance_criteria"),
+                executor_id=(str(args.get("executor_id") or "").strip() or None),
+                **common,
+            )
+        elif action == "inspect_card":
+            result = project_cards.inspect_card(
+                str(args.get("card_id") or ""),
+                board=(str(args.get("board") or "").strip() or None),
+            )
+        elif action == "inspect_project":
+            result = project_cards.inspect_project(
+                str(args.get("project_id") or "")
+            )
+        elif action == "close_project":
+            result = project_cards.close_project(
+                str(args.get("project_id") or "")
+            )
+        elif action == "reopen_project":
+            result = project_cards.reopen_project(
+                str(args.get("project_id") or "")
+            )
+        elif action == "locate_card":
+            located = project_cards.locate_card(
+                str(args.get("card_id") or ""),
+                board=(str(args.get("board") or "").strip() or None),
+            )
+            result = {
+                "schema": project_cards.SCHEMA,
+                "action": "locate_card",
+                "board": located["board"],
+                "card": {
+                    "id": located["task"].id,
+                    "project_id": located["task"].project_id,
+                    "root_task_id": located["task"].root_task_id,
+                    "status": located["task"].status,
+                    "title": located["task"].title,
+                },
+            }
+        else:
+            return tool_error(f"supervisor_project: unknown action {action!r}")
+
+        created_ids: list[str] = []
+        if isinstance(result.get("card"), dict) and result["card"].get("id"):
+            created_ids.append(str(result["card"]["id"]))
+        for card in result.get("cards") or []:
+            if isinstance(card, dict) and card.get("id"):
+                created_ids.append(str(card["id"]))
+        if created_ids and _kwargs.get("notification_route"):
+            notifications = []
+            board = str(result.get("board") or kb.DEFAULT_BOARD)
+            with kb.connect_closing(board=board) as conn:
+                for task_id in created_ids:
+                    notifications.append(
+                        _subscribe_delegated_task(
+                            conn,
+                            task_id=task_id,
+                            route=_kwargs.get("notification_route"),
+                            session_id=session_id,
+                        )
+                    )
+            result["notifications"] = notifications
+        return json.dumps(result, ensure_ascii=False)
+    except Exception as exc:
+        return tool_error(f"supervisor_project: {exc}")
+
+
 def _handle_adapter(args: dict[str, Any], **_kwargs) -> str:
     """One conversational control surface shared by Telegram and CLI root."""
     action = str(args.get("action") or "list").strip().lower()
@@ -1809,6 +1947,102 @@ SUPERVISOR_DELEGATE_SCHEMA = {
     },
 }
 
+SUPERVISOR_PROJECT_SCHEMA = {
+    "name": "supervisor_project",
+    "description": (
+        "Native deterministic Project/Card Controller. Use it for long-lived "
+        "team projects and card chains: start a project, continue a completed "
+        "or active card with a follow-up, split work into parallel role cards, "
+        "create an independent verification card, recover failed work through "
+        "another compatible adapter, inspect/locate old cards, or close/reopen "
+        "a project. This is controller authority, not a worker adapter: workers "
+        "execute the resulting immutable Role Shell cards and cannot mutate the "
+        "project graph themselves. Completed cards stay immutable."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "action": {
+                "type": "string",
+                "enum": [
+                    "list_projects",
+                    "start_project",
+                    "continue_card",
+                    "split_card",
+                    "verify_card",
+                    "recover_card",
+                    "inspect_card",
+                    "inspect_project",
+                    "locate_card",
+                    "close_project",
+                    "reopen_project",
+                ],
+            },
+            "project_id": {"type": "string"},
+            "project_name": {"type": "string"},
+            "project_slug": {"type": "string"},
+            "card_id": {"type": "string"},
+            "title": {"type": "string"},
+            "body": {"type": "string"},
+            "shell_key": {
+                "type": "string",
+                "description": (
+                    "Active Role Shell key. Follow-up and recovery inherit the "
+                    "source card when omitted; verification always uses verification."
+                ),
+            },
+            "acceptance_criteria": {
+                "type": "array",
+                "items": {"type": "string"},
+            },
+            "input_refs": {
+                "type": "array",
+                "items": {"type": "string"},
+            },
+            "cards": {
+                "type": "array",
+                "maxItems": 20,
+                "description": "Child card objects for split_card.",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "title": {"type": "string"},
+                        "body": {"type": "string"},
+                        "shell_key": {"type": "string"},
+                        "acceptance_criteria": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                        },
+                        "input_refs": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                        },
+                        "workspace_kind": {
+                            "type": "string",
+                            "enum": ["scratch", "dir", "worktree"],
+                        },
+                        "workspace_path": {"type": "string"},
+                        "priority": {"type": "integer"},
+                        "executor_id": {"type": "string"},
+                    },
+                    "required": ["title"],
+                },
+            },
+            "board": {"type": "string", "default": "default"},
+            "primary_path": {"type": "string"},
+            "workspace_kind": {
+                "type": "string",
+                "enum": ["scratch", "dir", "worktree"],
+            },
+            "workspace_path": {"type": "string"},
+            "executor_id": {"type": "string"},
+            "priority": {"type": "integer", "default": 0},
+            "include_archived": {"type": "boolean", "default": False},
+        },
+        "required": ["action"],
+    },
+}
+
 SUPERVISOR_ADAPTER_SCHEMA = {
     "name": "supervisor_adapter",
     "description": (
@@ -1946,6 +2180,15 @@ tool_registry.register(
     toolset="supervisor",
     schema=SUPERVISOR_DELEGATE_SCHEMA,
     handler=_handle_delegate,
+    check_fn=_check_supervisor_mode,
+    emoji="control",
+)
+
+tool_registry.register(
+    name="supervisor_project",
+    toolset="supervisor",
+    schema=SUPERVISOR_PROJECT_SCHEMA,
+    handler=_handle_project_cards,
     check_fn=_check_supervisor_mode,
     emoji="control",
 )

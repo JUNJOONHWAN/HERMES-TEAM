@@ -65,6 +65,9 @@ CREATE TABLE IF NOT EXISTS projects (
     board_slug    TEXT,
     primary_path  TEXT,
     created_at    INTEGER NOT NULL,
+    updated_at    INTEGER NOT NULL,
+    completed_at  INTEGER,
+    status        TEXT NOT NULL DEFAULT 'active',
     archived      INTEGER NOT NULL DEFAULT 0
 );
 
@@ -201,6 +204,7 @@ def connect_closing(db_path: Optional[Path] = None):
 # TEXT columns added to `projects` after v1; re-applied idempotently on every
 # open so a legacy DB upgrades in place.
 _OPTIONAL_PROJECT_COLUMNS = ("board_slug", "primary_path", "icon", "color")
+VALID_PROJECT_STATUSES = frozenset({"active", "completed"})
 
 
 def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
@@ -209,6 +213,25 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
     for col in _OPTIONAL_PROJECT_COLUMNS:
         if col not in cols:
             _add_column_if_missing(conn, "projects", col, f"{col} TEXT")
+    if "updated_at" not in cols:
+        _add_column_if_missing(
+            conn,
+            "projects",
+            "updated_at",
+            "updated_at INTEGER NOT NULL DEFAULT 0",
+        )
+        conn.execute(
+            "UPDATE projects SET updated_at = created_at WHERE updated_at = 0"
+        )
+    if "completed_at" not in cols:
+        _add_column_if_missing(conn, "projects", "completed_at", "completed_at INTEGER")
+    if "status" not in cols:
+        _add_column_if_missing(
+            conn,
+            "projects",
+            "status",
+            "status TEXT NOT NULL DEFAULT 'active'",
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -243,6 +266,9 @@ class Project:
     color: Optional[str] = None
     board_slug: Optional[str] = None
     primary_path: Optional[str] = None
+    status: str = "active"
+    updated_at: int = 0
+    completed_at: Optional[int] = None
     archived: bool = False
     folders: List[ProjectFolder] = field(default_factory=list)
 
@@ -256,6 +282,9 @@ class Project:
             "color": self.color,
             "board_slug": self.board_slug,
             "primary_path": self.primary_path,
+            "status": self.status,
+            "updated_at": self.updated_at,
+            "completed_at": self.completed_at,
             "archived": bool(self.archived),
             "created_at": self.created_at,
             "folders": [f.to_dict() for f in self.folders],
@@ -274,6 +303,17 @@ def _project_from_row(row: sqlite3.Row) -> Project:
         color=row["color"] if "color" in keys else None,
         board_slug=row["board_slug"] if "board_slug" in keys else None,
         primary_path=row["primary_path"] if "primary_path" in keys else None,
+        status=row["status"] if "status" in keys else "active",
+        updated_at=(
+            int(row["updated_at"])
+            if "updated_at" in keys and row["updated_at"] is not None
+            else int(row["created_at"])
+        ),
+        completed_at=(
+            int(row["completed_at"])
+            if "completed_at" in keys and row["completed_at"] is not None
+            else None
+        ),
         archived=bool(row["archived"]) if "archived" in keys else False,
     )
 
@@ -362,8 +402,8 @@ def create_project(
         conn.execute(
             "INSERT INTO projects "
             "(id, slug, name, description, icon, color, board_slug, "
-            " primary_path, created_at, archived) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0)",
+            " primary_path, created_at, updated_at, status, archived) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', 0)",
             (
                 pid,
                 unique,
@@ -373,6 +413,7 @@ def create_project(
                 color,
                 normalize_slug(board_slug) if board_slug else None,
                 primary,
+                now,
                 now,
             ),
         )
@@ -451,6 +492,8 @@ def update_project(
         params.append(normalize_slug(board_slug) if board_slug.strip() else None)
     if not sets:
         return False
+    sets.append("updated_at = ?")
+    params.append(_now())
     params.append(project_id)
     with write_txn(conn):
         cur = conn.execute(
@@ -570,7 +613,8 @@ def set_primary(conn: sqlite3.Connection, project_id: str, path: str) -> bool:
 def archive_project(conn: sqlite3.Connection, project_id: str) -> bool:
     with write_txn(conn):
         cur = conn.execute(
-            "UPDATE projects SET archived = 1 WHERE id = ?", (project_id,)
+            "UPDATE projects SET archived = 1, updated_at = ? WHERE id = ?",
+            (_now(), project_id),
         )
     return cur.rowcount > 0
 
@@ -578,7 +622,8 @@ def archive_project(conn: sqlite3.Connection, project_id: str) -> bool:
 def restore_project(conn: sqlite3.Connection, project_id: str) -> bool:
     with write_txn(conn):
         cur = conn.execute(
-            "UPDATE projects SET archived = 0 WHERE id = ?", (project_id,)
+            "UPDATE projects SET archived = 0, updated_at = ? WHERE id = ?",
+            (_now(), project_id),
         )
     return cur.rowcount > 0
 
@@ -587,6 +632,34 @@ def delete_project(conn: sqlite3.Connection, project_id: str) -> bool:
     """Hard-delete a project and its folders (cascade)."""
     with write_txn(conn):
         cur = conn.execute("DELETE FROM projects WHERE id = ?", (project_id,))
+    return cur.rowcount > 0
+
+
+def set_project_status(
+    conn: sqlite3.Connection,
+    project_id: str,
+    status: str,
+) -> bool:
+    """Transition a project between ``active`` and ``completed``.
+
+    Card state is validated by the Project/Card Controller before this store
+    function is called.  Keeping that policy out of this low-level module lets
+    CLI and desktop metadata code continue to use the Project store without
+    importing Kanban.
+    """
+    normalized = str(status or "").strip().lower()
+    if normalized not in VALID_PROJECT_STATUSES:
+        raise ValueError(
+            f"project status must be one of {sorted(VALID_PROJECT_STATUSES)}"
+        )
+    now = _now()
+    completed_at = now if normalized == "completed" else None
+    with write_txn(conn):
+        cur = conn.execute(
+            "UPDATE projects SET status = ?, completed_at = ?, updated_at = ? "
+            "WHERE id = ?",
+            (normalized, completed_at, now, project_id),
+        )
     return cur.rowcount > 0
 
 

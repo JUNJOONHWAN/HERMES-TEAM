@@ -12,6 +12,7 @@ SUPERVISOR_CONTROL_TOOL_SEQUENCE = (
     "supervisor_automation",
     "supervisor_roles",
     "supervisor_delegate",
+    "supervisor_project",
     "supervisor_adapter",
 )
 SUPERVISOR_CONTROL_TOOL_NAMES = frozenset(SUPERVISOR_CONTROL_TOOL_SEQUENCE)
@@ -34,6 +35,9 @@ Your permanent architecture:
   task summaries, receipts, and audit state.
 - MCP and domain capabilities belong to worker executors. The controller's
   supervisor tools below are local control-plane calls, not MCP tools.
+- Project/card lifecycle is native controller authority. Project metadata,
+  root-card threads, typed relations, close/reopen transitions, and recovery
+  lineage are never delegated to an adapter.
 
 Operating rules:
 1. Never perform domain work yourself. Choose the matching role shell and call
@@ -64,6 +68,10 @@ Operating rules:
    matching supervisor tool. Never guess from conversation memory.
    Controller-owned state changes are also your job: use supervisor_automation
    or supervisor_adapter directly instead of merely describing a missing rule.
+   Use supervisor_project for project creation, project/card inspection,
+   follow-up cards, parallel splits, verification cards, recovery cards, old
+   card lookup, and project close/reopen. An adapter may execute or propose a
+   card, but only this controller tool may commit the project/card graph.
 4. Never use shell, filesystem search, git, logs, web search, MCP, raw Kanban
    tools, or code edits to discover or mutate supervisor state. If a supervisor
    tool fails, report the bridge failure; do not work around it. Never claim a
@@ -122,6 +130,15 @@ _ADAPTER_REQUEST = re.compile(
     # adapter-only answer.
     r"(?:(?:어|아)[댑뎁답갭][터커]|어댑터|아댑터|실행기|카드|칸반|작업|"
     r"adapter|executor|kanban|task)",
+    re.IGNORECASE,
+)
+_PROJECT_CARD_REQUEST = re.compile(
+    r"(?:프로젝트|project|"
+    r"(?:후속|연속|다음)\s*(?:카드|작업)|"
+    r"(?:카드|작업)(?:을|를|에|의)?\s*(?:관계|계보|묶음|분해|병렬|검증|복구|이어|계속|종결|종료|재개)|"
+    r"(?:카드|작업)\s*(?:매니저|관리자)|"
+    r"(?:card|task)\s*(?:chain|thread|follow[- ]?up|split|verify|recover|continue)|"
+    r"(?:close|reopen)\s+project)",
     re.IGNORECASE,
 )
 _AUTOMATION_REQUEST = re.compile(
@@ -281,6 +298,8 @@ def supervisor_recovery_tool_name(user_message: str) -> str:
     controller ignored that contract and returned prose without a tool call.
     """
     text = str(user_message or "").strip()
+    if _PROJECT_CARD_REQUEST.search(text):
+        return "supervisor_project"
     if supervisor_repair_delegation_required(text):
         return "supervisor_delegate"
     if supervisor_tool_management_delegation_required(text):
@@ -305,6 +324,8 @@ def supervisor_required_tool_name(user_message: str) -> str | None:
     technically touched the control plane.
     """
     text = str(user_message or "").strip()
+    if _PROJECT_CARD_REQUEST.search(text):
+        return "supervisor_project"
     if supervisor_repair_delegation_required(text):
         return "supervisor_delegate"
     if supervisor_tool_management_delegation_required(text):

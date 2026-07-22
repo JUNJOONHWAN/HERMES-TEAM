@@ -57,6 +57,22 @@ def test_substantive_supervisor_turn_requires_control_tool():
     assert supervisor_control_tool_required("Cronjob Response: heartbeat") is False
 
 
+def test_project_and_card_management_routes_to_native_controller():
+    messages = (
+        "새 프로젝트를 시작하고 첫 카드 만들어줘",
+        "t_abcd 카드에 후속 작업을 붙여줘",
+        "이 프로젝트 카드들을 병렬로 쪼개줘",
+        "완료 카드에 검증 카드를 이어줘",
+        "실패한 카드 복구 카드를 만들어줘",
+    )
+    for message in messages:
+        assert supervisor_required_tool_name(message) == "supervisor_project"
+        assert supervisor_recovery_tool_name(message) == "supervisor_project"
+
+    # Ordinary adapter inventory still belongs to adapter governance.
+    assert supervisor_required_tool_name("현재 어댑터 카드 보여줘") == "supervisor_adapter"
+
+
 def test_repair_turn_requires_and_normalizes_codex_delegation():
     message = "하트비트 버그 원인을 찾아서 고쳐줘"
     assert supervisor_repair_delegation_required(message) is True
@@ -335,7 +351,7 @@ def test_adapter_operator_text_wins_when_provider_emits_extra_status_tool():
     }
 
 
-def test_supervisor_control_plane_requires_real_five_tool_controller():
+def test_supervisor_control_plane_requires_complete_native_controller():
     controller = SimpleNamespace(
         _supervisor_mode=True,
         valid_tool_names=set(SUPERVISOR_CONTROL_TOOL_SEQUENCE),
@@ -346,6 +362,7 @@ def test_supervisor_control_plane_requires_real_five_tool_controller():
     )
     assert supervisor_control_plane_active(controller) is True
     assert supervisor_control_plane_active(compression_helper) is False
+    assert "supervisor_project" in SUPERVISOR_CONTROL_TOOL_SEQUENCE
 
 
 def test_supervisor_tool_choice_payloads_match_provider_api_modes():

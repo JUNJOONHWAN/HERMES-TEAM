@@ -50,6 +50,7 @@ from pydantic import BaseModel, Field
 
 from hermes_cli import kanban_db
 from hermes_cli import kanban_diagnostics as kd
+from hermes_cli import project_card_controller
 from hermes_cli import supervisor_registry
 
 log = logging.getLogger(__name__)
@@ -360,7 +361,7 @@ def _warnings_summary_from_diagnostics(
     }
 
 
-def _links_for(conn: sqlite3.Connection, task_id: str) -> dict[str, list[str]]:
+def _links_for(conn: sqlite3.Connection, task_id: str) -> dict[str, Any]:
     """Return {'parents': [...], 'children': [...]} for a task."""
     parents = [
         r["parent_id"]
@@ -376,7 +377,13 @@ def _links_for(conn: sqlite3.Connection, task_id: str) -> dict[str, list[str]]:
             (task_id,),
         )
     ]
-    return {"parents": parents, "children": children}
+    typed = kanban_db.task_link_details(conn, task_id)
+    return {
+        "parents": parents,
+        "children": children,
+        "incoming": typed["incoming"],
+        "outgoing": typed["outgoing"],
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -734,6 +741,175 @@ def rerun_task_with_adapter(
 
 
 # ---------------------------------------------------------------------------
+# Native Project/Card Controller — same deterministic service as Telegram
+# ---------------------------------------------------------------------------
+
+class ProjectStartBody(BaseModel):
+    name: str
+    goal: str
+    shell_key: str
+    slug: Optional[str] = None
+    description: Optional[str] = None
+    primary_path: Optional[str] = None
+    acceptance_criteria: list[str] = Field(default_factory=list)
+    input_refs: list[str] = Field(default_factory=list)
+    priority: int = 0
+    executor_id: Optional[str] = None
+
+
+class CardContinueBody(BaseModel):
+    title: str
+    body: Optional[str] = None
+    shell_key: Optional[str] = None
+    acceptance_criteria: list[str] = Field(default_factory=list)
+    input_refs: list[str] = Field(default_factory=list)
+    workspace_kind: Optional[str] = None
+    workspace_path: Optional[str] = None
+    priority: int = 0
+    executor_id: Optional[str] = None
+
+
+class CardSplitBody(BaseModel):
+    cards: list[dict[str, Any]] = Field(default_factory=list)
+
+
+class CardActionBody(BaseModel):
+    title: Optional[str] = None
+    body: Optional[str] = None
+    shell_key: Optional[str] = None
+    acceptance_criteria: list[str] = Field(default_factory=list)
+    executor_id: Optional[str] = None
+
+
+@router.get("/projects")
+def list_managed_projects(include_archived: bool = Query(False)):
+    return project_card_controller.list_projects(
+        include_archived=include_archived
+    )
+
+
+@router.post("/projects/start")
+def start_managed_project(
+    payload: ProjectStartBody,
+    board: Optional[str] = Query(None),
+):
+    try:
+        return project_card_controller.start_project(
+            name=payload.name,
+            goal=payload.goal,
+            shell_key=payload.shell_key,
+            slug=payload.slug,
+            description=payload.description,
+            primary_path=payload.primary_path,
+            board=_resolve_board(board) or kanban_db.DEFAULT_BOARD,
+            acceptance_criteria=payload.acceptance_criteria,
+            input_refs=payload.input_refs,
+            priority=payload.priority,
+            executor_id=payload.executor_id,
+            created_by="dashboard-project-card-controller",
+        )
+    except (ValueError, project_card_controller.ProjectCardControllerError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+@router.get("/projects/{project_id}")
+def inspect_managed_project(project_id: str):
+    try:
+        return project_card_controller.inspect_project(project_id)
+    except (ValueError, project_card_controller.ProjectCardControllerError) as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+
+
+@router.post("/projects/{project_id}/close")
+def close_managed_project(project_id: str):
+    try:
+        return project_card_controller.close_project(project_id)
+    except (ValueError, project_card_controller.ProjectCardControllerError) as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+
+
+@router.post("/projects/{project_id}/reopen")
+def reopen_managed_project(project_id: str):
+    try:
+        return project_card_controller.reopen_project(project_id)
+    except (ValueError, project_card_controller.ProjectCardControllerError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+@router.get("/cards/{card_id}/inspect")
+def inspect_managed_card(card_id: str, board: Optional[str] = Query(None)):
+    try:
+        return project_card_controller.inspect_card(
+            card_id,
+            board=_resolve_board(board),
+        )
+    except (ValueError, project_card_controller.ProjectCardControllerError) as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+
+
+@router.post("/cards/{card_id}/continue")
+def continue_managed_card(card_id: str, payload: CardContinueBody):
+    try:
+        return project_card_controller.continue_card(
+            card_id,
+            title=payload.title,
+            body=payload.body,
+            shell_key=payload.shell_key,
+            acceptance_criteria=payload.acceptance_criteria,
+            input_refs=payload.input_refs,
+            workspace_kind=payload.workspace_kind,
+            workspace_path=payload.workspace_path,
+            priority=payload.priority,
+            executor_id=payload.executor_id,
+            created_by="dashboard-project-card-controller",
+        )
+    except (ValueError, project_card_controller.ProjectCardControllerError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+@router.post("/cards/{card_id}/split")
+def split_managed_card(card_id: str, payload: CardSplitBody):
+    try:
+        return project_card_controller.split_card(
+            card_id,
+            cards=payload.cards,
+            created_by="dashboard-project-card-controller",
+        )
+    except (ValueError, project_card_controller.ProjectCardControllerError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+@router.post("/cards/{card_id}/verify")
+def verify_managed_card(card_id: str, payload: CardActionBody):
+    try:
+        return project_card_controller.verify_card(
+            card_id,
+            title=payload.title,
+            body=payload.body,
+            acceptance_criteria=payload.acceptance_criteria,
+            created_by="dashboard-project-card-controller",
+        )
+    except (ValueError, project_card_controller.ProjectCardControllerError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+@router.post("/cards/{card_id}/recover")
+def recover_managed_card(card_id: str, payload: CardActionBody):
+    try:
+        return project_card_controller.recover_card(
+            card_id,
+            title=payload.title,
+            body=payload.body,
+            shell_key=payload.shell_key,
+            acceptance_criteria=payload.acceptance_criteria,
+            executor_id=payload.executor_id,
+            created_by="dashboard-project-card-controller",
+        )
+    except (ValueError, project_card_controller.ProjectCardControllerError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+# ---------------------------------------------------------------------------
 # POST /tasks
 # ---------------------------------------------------------------------------
 
@@ -752,6 +928,12 @@ class CreateTaskBody(BaseModel):
     skills: Optional[list[str]] = None
     goal_mode: bool = False
     goal_max_turns: Optional[int] = None
+    project_id: Optional[str] = None
+    root_task_id: Optional[str] = None
+    role_shell_id: Optional[str] = None
+    acceptance_criteria: list[str] = Field(default_factory=list)
+    input_refs: list[str] = Field(default_factory=list)
+    parent_link_type: str = "depends_on"
 
 
 @router.post("/tasks")
@@ -776,6 +958,12 @@ def create_task(payload: CreateTaskBody, board: Optional[str] = Query(None)):
             skills=payload.skills,
             goal_mode=payload.goal_mode,
             goal_max_turns=payload.goal_max_turns,
+            project_id=payload.project_id,
+            root_task_id=payload.root_task_id,
+            role_shell_id=payload.role_shell_id,
+            acceptance_criteria=payload.acceptance_criteria,
+            input_refs=payload.input_refs,
+            parent_link_type=payload.parent_link_type,
         )
         task = kanban_db.get_task(conn, task_id)
         body: dict[str, Any] = {"task": _task_dict(task) if task else None}
@@ -1128,7 +1316,9 @@ def _parents_blocking_ready(
     rows = conn.execute(
         "SELECT t.id, t.title, t.status FROM tasks t "
         "JOIN task_links l ON l.parent_id = t.id "
-        "WHERE l.child_id = ? AND t.status != 'done'",
+        "WHERE l.child_id = ? "
+        "AND l.relation_type IN ('depends_on', 'follows', 'reviews') "
+        "AND t.status != 'done'",
         (task_id,),
     ).fetchall()
     return [
@@ -1166,7 +1356,8 @@ def _set_status_direct(
             parent_statuses = conn.execute(
                 "SELECT t.status FROM tasks t "
                 "JOIN task_links l ON l.parent_id = t.id "
-                "WHERE l.child_id = ?",
+                "WHERE l.child_id = ? "
+                "AND l.relation_type IN ('depends_on', 'follows', 'reviews')",
                 (task_id,),
             ).fetchall()
             if parent_statuses and not all(
@@ -1208,7 +1399,9 @@ def _set_status_direct(
             # the dependency gate. Demote those children immediately so the
             # dashboard does not keep advertising stale-ready work.
             for row in conn.execute(
-                "SELECT child_id FROM task_links WHERE parent_id = ? ORDER BY child_id",
+                "SELECT child_id FROM task_links WHERE parent_id = ? "
+                "AND relation_type IN ('depends_on', 'follows', 'reviews') "
+                "ORDER BY child_id",
                 (task_id,),
             ).fetchall():
                 child_id = row["child_id"]
@@ -1272,6 +1465,7 @@ def add_comment(task_id: str, payload: CommentBody, board: Optional[str] = Query
 class LinkBody(BaseModel):
     parent_id: str
     child_id: str
+    relation_type: str = "depends_on"
 
 
 @router.post("/links")
@@ -1279,7 +1473,12 @@ def add_link(payload: LinkBody, board: Optional[str] = Query(None)):
     board = _resolve_board(board)
     conn = _conn(board=board)
     try:
-        kanban_db.link_tasks(conn, payload.parent_id, payload.child_id)
+        kanban_db.link_tasks(
+            conn,
+            payload.parent_id,
+            payload.child_id,
+            relation_type=payload.relation_type,
+        )
         return {"ok": True}
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))

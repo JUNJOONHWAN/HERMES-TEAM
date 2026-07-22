@@ -525,6 +525,8 @@
 
     const [tenantFilter, setTenantFilter] = useState("");
     const [assigneeFilter, setAssigneeFilter] = useState("");
+    const [projectFilter, setProjectFilter] = useState("");
+    const [projects, setProjects] = useState([]);
     const [includeArchived, setIncludeArchived] = useState(false);
     const [search, setSearch] = useState("");
     const [laneByProfile, setLaneByProfile] = useState(true);
@@ -605,6 +607,17 @@
     }, [board]);
 
     useEffect(function () { loadBoardList(); }, [loadBoardList]);
+
+    // Projects are controller-owned work streams that can share a board.
+    // Boards remain storage/views; selecting a project switches to its bound
+    // board and narrows the grid to that project's card threads.
+    const loadProjects = useCallback(function () {
+      return SDK.fetchJSON(`${API}/projects`)
+        .then(function (data) { setProjects((data && data.projects) || []); })
+        .catch(function () { setProjects([]); });
+    }, []);
+
+    useEffect(function () { loadProjects(); }, [loadProjects]);
 
     const scheduleReload = useCallback(function () {
       if (reloadTimerRef.current) return;
@@ -701,6 +714,7 @@
       const filterTask = function (t) {
         if (tenantFilter && t.tenant !== tenantFilter) return false;
         if (assigneeFilter && t.assignee !== assigneeFilter) return false;
+        if (projectFilter && t.project_id !== projectFilter) return false;
         if (q) {
           const hay = `${t.id} ${t.title || ""} ${t.body || ""} ${t.result || ""} ${t.latest_summary || ""} ${t.assignee || ""} ${t.tenant || ""}`.toLowerCase();
           if (hay.indexOf(q) === -1) return false;
@@ -712,7 +726,7 @@
           return Object.assign({}, col, { tasks: col.tasks.filter(filterTask) });
         }),
       });
-    }, [boardData, tenantFilter, assigneeFilter, search]);
+    }, [boardData, tenantFilter, assigneeFilter, projectFilter, search]);
 
     // --- actions ------------------------------------------------------------
     const moveTask = useCallback(function (taskId, newStatus) {
@@ -958,6 +972,42 @@
       clearSelected();
     }, [board, clearSelected]);
 
+    const startProject = useCallback(function (payload) {
+      return SDK.fetchJSON(withBoard(`${API}/projects/start`, board), {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      }).then(function (res) {
+        const project = res && res.project;
+        const targetBoard = (res && res.board) || board;
+        if (targetBoard && targetBoard !== board) switchBoard(targetBoard);
+        if (project && project.id) setProjectFilter(project.id);
+        return Promise.all([loadProjects(), loadBoard(), loadBoardList()]).then(function () {
+          return res;
+        });
+      });
+    }, [board, loadBoard, loadBoardList, loadProjects, switchBoard]);
+
+    const chooseProject = useCallback(function (projectId) {
+      const selected = projects.find(function (p) { return p.id === projectId; });
+      setProjectFilter(projectId || "");
+      if (selected && selected.board && selected.board !== board) {
+        switchBoard(selected.board);
+      }
+    }, [projects, board, switchBoard]);
+
+    const setProjectStatus = useCallback(function (projectId, action) {
+      return SDK.fetchJSON(`${API}/projects/${encodeURIComponent(projectId)}/${action}`, {
+        method: "POST",
+      }).then(function () {
+        if (action === "close" && projectFilter === projectId) setProjectFilter("");
+        return Promise.all([loadProjects(), loadBoard()]);
+      }).catch(function (e) {
+        setError(parseApiErrorMessage(e));
+        throw e;
+      });
+    }, [projectFilter, loadProjects, loadBoard]);
+
     const createNewBoard = useCallback(function (payload) {
       return SDK.fetchJSON(`${API}/boards`, {
         method: "POST",
@@ -1035,6 +1085,14 @@
           onSwitch: switchBoard,
           onNewClick: function () { setShowNewBoard(true); },
           onDeleteBoard: deleteBoard,
+        }),
+        h(ProjectControllerPanel, {
+          projects: projects,
+          selectedProjectId: projectFilter,
+          board: board,
+          onSelect: chooseProject,
+          onStart: startProject,
+          onStatus: setProjectStatus,
         }),
         showNewBoard ? h(NewBoardDialog, {
           onCancel: function () { setShowNewBoard(false); },
@@ -2026,6 +2084,105 @@
           title: "Auto-generate a description from this profile's skills and model",
         }, busy === "auto" ? "Generating…" : "⚗ Auto"),
       ),
+    );
+  }
+
+  function ProjectControllerPanel(props) {
+    const list = props.projects || [];
+    const selected = list.find(function (p) { return p.id === props.selectedProjectId; });
+    const [busy, setBusy] = useState(false);
+    const [msg, setMsg] = useState(null);
+
+    const start = function () {
+      const name = window.prompt("Project name");
+      if (name === null || !name.trim()) return;
+      const goal = window.prompt("First card goal — make it a concrete deliverable");
+      if (goal === null || !goal.trim()) return;
+      const shell = window.prompt(
+        "Role Shell for the first card (code, browser, market, operations, tool-management, verification)",
+        "code",
+      );
+      if (shell === null || !shell.trim()) return;
+      const primaryPath = window.prompt(
+        "Primary project folder (optional; code cards use its git worktrees)",
+        "",
+      );
+      if (primaryPath === null) return;
+      const acceptance = window.prompt(
+        "Acceptance criteria (one per line)",
+        "Requested result is complete\nRelevant validation passes\nEvidence is attached to the card",
+      );
+      if (acceptance === null) return;
+      setBusy(true); setMsg(null);
+      props.onStart({
+        name: name.trim(),
+        goal: goal.trim(),
+        shell_key: shell.trim(),
+        primary_path: primaryPath.trim() || null,
+        acceptance_criteria: acceptance.split("\n").map(function (s) { return s.trim(); }).filter(Boolean),
+      }).then(function (res) {
+        const id = res && res.project && res.project.id;
+        setMsg({ ok: true, text: `Project started${id ? `: ${id}` : ""}` });
+      }).catch(function (e) {
+        setMsg({ ok: false, text: parseApiErrorMessage(e) });
+      }).finally(function () { setBusy(false); });
+    };
+
+    const changeStatus = function (action) {
+      if (!selected || busy) return;
+      if (action === "close" && !window.confirm(
+        "Close this project? Every card must already be done or archived.",
+      )) return;
+      setBusy(true); setMsg(null);
+      props.onStatus(selected.id, action)
+        .then(function () {
+          setMsg({ ok: true, text: action === "close" ? "Project closed." : "Project reopened." });
+        })
+        .catch(function (e) { setMsg({ ok: false, text: parseApiErrorMessage(e) }); })
+        .finally(function () { setBusy(false); });
+    };
+
+    return h("div", { className: "hermes-kanban-section" },
+      h("div", { className: "hermes-kanban-section-head-row" },
+        h("div", null,
+          h("div", { className: "hermes-kanban-section-head" }, "Project / Card Controller"),
+          h("div", { className: "text-[10px] text-muted-foreground" },
+            "The controller owns project lifecycle and card relations; Role Shell adapters execute the cards."),
+        ),
+        h("div", { className: "flex flex-wrap gap-2 items-center" },
+          h(Select, Object.assign({
+            value: props.selectedProjectId || "",
+            className: "h-8 min-w-[240px]",
+            "aria-label": "Filter by project",
+          }, selectChangeHandler(props.onSelect)),
+            h(SelectOption, { value: "" }, "All project and standalone cards"),
+            list.map(function (p) {
+              const status = p.status === "completed" ? "closed" : "active";
+              return h(SelectOption, { key: p.id, value: p.id },
+                `${p.name} · ${status} · ${p.card_count || 0} cards`);
+            }),
+          ),
+          h(Button, { size: "sm", disabled: busy, onClick: start },
+            busy ? "Working…" : "+ Start project"),
+          selected && selected.status === "active" ? h(Button, {
+            size: "sm", variant: "outline", disabled: busy,
+            onClick: function () { changeStatus("close"); },
+          }, "Close") : null,
+          selected && selected.status === "completed" ? h(Button, {
+            size: "sm", variant: "outline", disabled: busy,
+            onClick: function () { changeStatus("reopen"); },
+          }, "Reopen") : null,
+        ),
+      ),
+      selected ? h("div", { className: "text-xs mt-2" },
+        `${selected.id} · board=${selected.board || props.board} · threads=${selected.thread_count || 0} · ` +
+        `open=${Object.keys(selected.counts || {}).reduce(function (n, k) {
+          return n + (["done", "archived"].indexOf(k) === -1 ? (selected.counts[k] || 0) : 0);
+        }, 0)}`,
+      ) : null,
+      msg ? h("div", {
+        className: msg.ok ? "hermes-kanban-msg-ok" : "hermes-kanban-msg-err",
+      }, msg.text) : null,
     );
   }
 
@@ -3232,6 +3389,23 @@
       });
     };
 
+    const doProjectCardAction = function (action, payload) {
+      return SDK.fetchJSON(
+        `${API}/cards/${encodeURIComponent(props.taskId)}/${action}`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(payload || {}),
+        },
+      ).then(function (res) {
+        load(); props.onRefresh();
+        return res;
+      }).catch(function (e) {
+        setPatchErr(parseApiErrorMessage(e));
+        throw e;
+      });
+    };
+
     const addLink = function (parentId) {
       return SDK.fetchJSON(withBoard(`${API}/links`, boardSlug), {
         method: "POST",
@@ -3325,6 +3499,7 @@
           onSpecify: doSpecify,
           onDecompose: doDecompose,
           onAdapterAction: doAdapterAction,
+          onProjectCardAction: doProjectCardAction,
           onAddParent: addLink,
           onRemoveParent: removeLink,
           onAddChild: addChild,
@@ -3539,6 +3714,80 @@
     );
   }
 
+  function ProjectCardActions(props) {
+    const task = props.task;
+    const [busy, setBusy] = useState(false);
+    const [msg, setMsg] = useState(null);
+    if (!task.project_id) return null;
+
+    const invoke = function (action, payload) {
+      setBusy(true); setMsg(null);
+      return props.onAction(action, payload)
+        .then(function (res) {
+          const cards = res && res.cards;
+          const created = cards && cards.length
+            ? cards.map(function (c) { return c.id; }).join(", ")
+            : (res && res.card && res.card.id);
+          setMsg({ ok: true, text: `${action} created${created ? `: ${created}` : "."}` });
+        })
+        .catch(function (e) { setMsg({ ok: false, text: parseApiErrorMessage(e) }); })
+        .finally(function () { setBusy(false); });
+    };
+
+    const followUp = function () {
+      const title = window.prompt("Follow-up card title");
+      if (title === null || !title.trim()) return;
+      const criteria = window.prompt("Acceptance criteria (one per line)", "Requested follow-up is complete\nEvidence is attached");
+      if (criteria === null) return;
+      invoke("continue", {
+        title: title.trim(),
+        acceptance_criteria: criteria.split("\n").map(function (s) { return s.trim(); }).filter(Boolean),
+      });
+    };
+
+    const split = function () {
+      const titles = window.prompt("Parallel card titles (one per line)");
+      if (titles === null) return;
+      const cards = titles.split("\n").map(function (s) { return s.trim(); }).filter(Boolean)
+        .map(function (title) { return { title: title }; });
+      if (!cards.length) return;
+      invoke("split", { cards: cards });
+    };
+
+    const verify = function () {
+      const title = window.prompt("Verification card title", `Verify ${task.id}: ${task.title || "card"}`);
+      if (title === null || !title.trim()) return;
+      invoke("verify", { title: title.trim() });
+    };
+
+    const recover = function () {
+      const title = window.prompt("Recovery card title", `Recover ${task.id}: ${task.title || "card"}`);
+      if (title === null || !title.trim()) return;
+      const shell = window.prompt("Recovery Role Shell (blank = same role)", "");
+      if (shell === null) return;
+      invoke("recover", { title: title.trim(), shell_key: shell.trim() || null });
+    };
+
+    return h("div", { className: "hermes-kanban-section" },
+      h("div", { className: "hermes-kanban-section-head" }, "Project card thread"),
+      h("div", { className: "text-xs text-muted-foreground mb-2" },
+        `project=${task.project_id} · root=${task.root_task_id || task.id}`),
+      h("div", { className: "flex flex-wrap gap-2" },
+        h(Button, { size: "sm", variant: "outline", disabled: busy, onClick: followUp }, "Follow-up"),
+        h(Button, { size: "sm", variant: "outline", disabled: busy, onClick: split }, "Split"),
+        h(Button, { size: "sm", variant: "outline", disabled: busy, onClick: verify }, "Verify"),
+        task.status !== "done" && task.status !== "running" ? h(Button, {
+          size: "sm", variant: "outline", disabled: busy, onClick: recover,
+        }, "Recover") : null,
+      ),
+      msg ? h("div", {
+        className: msg.ok ? "hermes-kanban-msg-ok" : "hermes-kanban-msg-err",
+      }, msg.text) : null,
+      h("div", { className: "text-[10px] text-muted-foreground mt-2" },
+        "Completed cards stay immutable. Follow-up and recovery always create linked cards."),
+    );
+  }
+
   function TaskDetail(props) {
     const { t: i18n } = useI18n();
     const t = props.data.task;
@@ -3569,6 +3818,8 @@
         h(AssigneeEditor, { task: t, onPatch: props.onPatch }),
         h(PriorityEditor, { task: t, onPatch: props.onPatch }),
         t.tenant ? h(MetaRow, { label: tx(i18n, "tenant", "Tenant"), value: t.tenant }) : null,
+        t.project_id ? h(MetaRow, { label: "Project", value: t.project_id }) : null,
+        t.root_task_id ? h(MetaRow, { label: "Root card", value: t.root_task_id }) : null,
         h(MetaRow, {
           label: tx(i18n, "workspace", "Workspace"),
           value: `${t.workspace_kind}${t.workspace_path ? ": " + t.workspace_path : ""}`,
@@ -3591,6 +3842,19 @@
         onSpecify: props.onSpecify,
         onDecompose: props.onDecompose,
       }),
+      h(ProjectCardActions, {
+        task: t,
+        onAction: props.onProjectCardAction,
+      }),
+      (t.acceptance_criteria && t.acceptance_criteria.length) ? h("div", { className: "hermes-kanban-section" },
+        h("div", { className: "hermes-kanban-section-head" }, "Acceptance criteria"),
+        h("ul", { className: "text-xs list-disc pl-5" },
+          t.acceptance_criteria.map(function (item, idx) { return h("li", { key: idx }, item); })),
+      ) : null,
+      (t.input_refs && t.input_refs.length) ? h("div", { className: "hermes-kanban-section" },
+        h("div", { className: "hermes-kanban-section-head" }, "Input references"),
+        h("div", { className: "text-xs" }, t.input_refs.join(" · ")),
+      ) : null,
       h(TaskAdapterSection, {
         task: t,
         adapter: props.data.adapter,

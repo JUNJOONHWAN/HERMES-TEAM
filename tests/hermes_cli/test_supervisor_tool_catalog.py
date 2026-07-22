@@ -2,12 +2,21 @@ import json
 
 import yaml
 
+from toolsets import resolve_toolset
 from hermes_cli.supervisor_tool_catalog import (
     build_tool_catalog,
     compact_tool_catalog,
     search_tool_catalog,
 )
 from tools import supervisor_tools
+
+
+def test_supervisor_toolset_exposes_native_project_controller():
+    tools = resolve_toolset("supervisor")
+
+    assert "supervisor_project" in tools
+    assert "supervisor_adapter" in tools
+    assert "supervisor_automation" in tools
 
 
 def _profile(home, name, *, toolsets=(), mcp_servers=(), skills=()):

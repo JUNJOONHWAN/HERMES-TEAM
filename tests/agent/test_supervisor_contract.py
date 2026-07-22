@@ -20,6 +20,7 @@ from agent.supervisor_contract import (
     supervisor_recovery_tool_name,
     supervisor_required_tool_name,
     supervisor_repair_delegation_required,
+    supervisor_hermes_repair_delegation_required,
     supervisor_tool_choice_payload,
     supervisor_tool_management_delegation_required,
 )
@@ -110,6 +111,34 @@ def test_repair_turn_requires_and_normalizes_codex_delegation():
         {},
     )
     assert eligible is False
+
+
+def test_hermes_self_maintenance_is_distinct_from_ordinary_code_repair():
+    hermes_message = "헤르메스 어댑터 라우팅 오류를 고쳐줘"
+    assert supervisor_hermes_repair_delegation_required(hermes_message) is True
+    arguments, eligible = normalize_supervisor_repair_delegation(
+        hermes_message,
+        "supervisor_delegate",
+        {"shell_key": "code", "title": "wrong initial shell"},
+    )
+    assert eligible is True
+    assert arguments["shell_key"] == "hermes-repair"
+    assert arguments["work_kind"] == "hermes_repair"
+
+    ordinary_message = "내 프로젝트의 결제 코드 버그를 고쳐줘"
+    assert supervisor_hermes_repair_delegation_required(ordinary_message) is False
+    arguments, eligible = normalize_supervisor_repair_delegation(
+        ordinary_message,
+        "supervisor_delegate",
+        {"shell_key": "code", "title": "ordinary code repair"},
+    )
+    assert eligible is True
+    assert arguments["shell_key"] == "code"
+    assert arguments["work_kind"] == "repair"
+
+    assert supervisor_hermes_repair_delegation_required(
+        "헤르메스가 내 프로젝트 코드를 고쳐줘"
+    ) is False
 
 
 def test_tool_mutation_is_pinned_to_multitool_delegation():

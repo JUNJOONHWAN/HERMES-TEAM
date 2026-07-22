@@ -34,7 +34,7 @@ python3 scripts/setup_public_edition.py --dry-run
 3. Timeline MCP와 OpenCode용 MCP 설정 생성
 4. NeuralLink `pre_llm_call` 플러그인 설치
 5. 루트를 zero-MCP 제어면으로 전환
-6. 격리 워커 프로필, 7개 Role Shell, Binding 설치
+6. 격리 워커 프로필, 8개 Role Shell, Binding 설치
 7. OpenCode 무료 모델 라우터와 worker adapter 등록
 8. 무료 모델 catalog + tool-call health gate가 통과할 때만 OpenCode를 기본 경로로 승격
 9. 세 층 Heartbeat 설치

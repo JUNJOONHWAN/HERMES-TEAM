@@ -26,6 +26,7 @@ from tools.registry import registry as tool_registry, tool_error
 
 
 DEFAULT_REPAIR_EXECUTOR_ID = "executor_hermes_worker_universal"
+DEFAULT_HERMES_REPAIR_EXECUTOR_ID = "executor_hermes_worker_hermes_maintainer"
 _REPAIR_TERMS = (
     "수선", "수정", "고치", "복구", "버그", "오류", "장애", "문제 해결",
     "repair", "fix", "debug", "bug", "incident", "restore", "recover",
@@ -40,6 +41,7 @@ _ROLE_ADAPTER_LABELS = {
     "report": "리포트 작성",
     "verification": "독립 검증",
     "tool-management": "멀티툴 관리",
+    "hermes-repair": "Hermes 수선",
 }
 _MOBILE_ROLE_LABELS = {
     "browser-research": "브라우저",
@@ -49,6 +51,7 @@ _MOBILE_ROLE_LABELS = {
     "report": "리포트",
     "verification": "검증",
     "tool-management": "멀티툴",
+    "hermes-repair": "Hermes 수선",
 }
 _ROLE_OPERATOR_DETAILS = {
     "browser-research": {
@@ -82,6 +85,10 @@ _ROLE_OPERATOR_DETAILS = {
     "tool-management": {
         "scope": ("MCP·스킬·툴 등록", "역할별 배정·검증"),
         "tools": ("File·Terminal·Web", "Skills·Kanban·Timeline"),
+    },
+    "hermes-repair": {
+        "scope": ("Hermes 자체 코드·설정·라우팅 수선", "다른 어댑터 결과 분석"),
+        "tools": ("File·Terminal", "Kanban·Timeline"),
     },
 }
 _ROLE_ADAPTER_COUNT = len(_ROLE_ADAPTER_LABELS)
@@ -118,6 +125,17 @@ def _repair_executor_id() -> str:
     )
 
 
+def _hermes_repair_executor_id() -> str:
+    config = load_config() or {}
+    supervisor = config.get("supervisor") or {}
+    if not isinstance(supervisor, dict):
+        supervisor = {}
+    return (
+        str(supervisor.get("hermes_repair_executor_id") or "").strip()
+        or DEFAULT_HERMES_REPAIR_EXECUTOR_ID
+    )
+
+
 def _repair_work_requested(args: dict[str, Any], shell_key: str) -> bool:
     explicit = str(args.get("work_kind") or "").strip().lower()
     if explicit == "repair":
@@ -128,6 +146,10 @@ def _repair_work_requested(args: dict[str, Any], shell_key: str) -> bool:
         str(args.get(name) or "").strip().lower() for name in ("title", "body")
     )
     return any(term in text for term in _REPAIR_TERMS)
+
+
+def _hermes_repair_work_requested(args: dict[str, Any]) -> bool:
+    return str(args.get("work_kind") or "").strip().lower() == "hermes_repair"
 
 
 def _compact_status(snapshot: dict[str, Any]) -> dict[str, Any]:
@@ -473,7 +495,7 @@ def _compact_adapter_view(view: dict[str, Any]) -> dict[str, Any]:
 
     The complete registry remains available to web/CLI callers through
     ``adapter_registry_view``.  The controller gets one stable topology:
-    Hermes controller, seven role adapters, each role's current execution
+    Hermes controller, eight role adapters, each role's current execution
     worker, and a grouped switch-candidate pool.  Raw history, repeated runtime
     blobs, epoch timestamps, and contradictory enabled/healthy glyphs are
     intentionally excluded.
@@ -1125,9 +1147,12 @@ def _handle_delegate(args: dict[str, Any], **_kwargs) -> str:
             requested_work_kind = str(
                 args.get("work_kind") or "normal"
             ).strip().lower()
-            if requested_work_kind not in {"normal", "repair", "tooling"}:
+            if requested_work_kind not in {
+                "normal", "repair", "hermes_repair", "tooling"
+            }:
                 return tool_error(
-                    "supervisor_delegate: work_kind must be normal, repair, or tooling"
+                    "supervisor_delegate: work_kind must be normal, repair, "
+                    "hermes_repair, or tooling"
                 )
             if (
                 requested_work_kind == "tooling"
@@ -1136,6 +1161,29 @@ def _handle_delegate(args: dict[str, Any], **_kwargs) -> str:
                 return tool_error(
                     "supervisor_delegate: tooling work must use the "
                     "tool-management role shell"
+                )
+            hermes_repair_work = _hermes_repair_work_requested(args)
+            if hermes_repair_work:
+                if shell.shell_key != "hermes-repair":
+                    return tool_error(
+                        "supervisor_delegate: Hermes self-maintenance must use "
+                        "the hermes-repair role shell"
+                    )
+                hermes_repair_executor = _hermes_repair_executor_id()
+                if (
+                    requested_executor
+                    and requested_executor != hermes_repair_executor
+                ):
+                    return tool_error(
+                        "supervisor_delegate: Hermes self-maintenance is pinned to "
+                        f"{hermes_repair_executor}; requested {requested_executor}"
+                    )
+                requested_executor = hermes_repair_executor
+            elif shell.shell_key == "hermes-repair":
+                return tool_error(
+                    "supervisor_delegate: hermes-repair accepts only explicit "
+                    "work_kind=hermes_repair; ordinary code repair stays on code "
+                    "or operations"
                 )
             repair_work = _repair_work_requested(args, shell.shell_key)
             if repair_work:
@@ -1152,7 +1200,7 @@ def _handle_delegate(args: dict[str, Any], **_kwargs) -> str:
                     )
                 requested_executor = repair_executor
             recovery_required_capabilities: set[str] = set()
-            if source_task_ids:
+            if source_task_ids and not hermes_repair_work:
                 source_shell_rows = conn.execute(
                     "SELECT DISTINCT rs.required_capabilities "
                     "FROM tasks t JOIN role_shells rs ON rs.id=t.role_shell_id "
@@ -1311,10 +1359,15 @@ def _handle_delegate(args: dict[str, Any], **_kwargs) -> str:
                         "repair policy pins the configured remediation executor"
                         if repair_work
                         else (
+                            "Hermes self-maintenance policy pins the dedicated "
+                            "maintainer executor"
+                            if hermes_repair_work
+                        else (
                             "result recovery requires source capabilities: "
                             + ", ".join(sorted(recovery_required_capabilities))
                             if recovery_required_capabilities
                             else None
+                        )
                         )
                     )
                 ),
@@ -1346,14 +1399,28 @@ def _handle_delegate(args: dict[str, Any], **_kwargs) -> str:
                 "role_shell_id": shell.id,
                 "status": "ready",
                 "executor_selection": (
-                    "pinned_configured_repair"
-                    if repair_work
-                    else "deferred_to_atomic_claim"
+                    "pinned_hermes_maintainer"
+                    if hermes_repair_work
+                    else (
+                        "pinned_configured_repair"
+                        if repair_work
+                        else "deferred_to_atomic_claim"
+                    )
                 ),
                 "requested_executor_id": requested_executor,
-                "work_kind": "repair" if repair_work else requested_work_kind,
+                "work_kind": (
+                    "hermes_repair"
+                    if hermes_repair_work
+                    else "repair" if repair_work else requested_work_kind
+                ),
                 "routing_policy": (
-                    "configured_repair_executor_required" if repair_work else None
+                    "dedicated_hermes_maintainer_required"
+                    if hermes_repair_work
+                    else (
+                        "configured_repair_executor_required"
+                        if repair_work
+                        else None
+                    )
                 ),
                 "adapter_override": detail.get("effective_override"),
                 "notification": notification,

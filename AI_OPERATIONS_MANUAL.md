@@ -263,6 +263,13 @@ contract after verifying its real argv.
 `controller_openrouter_gemma4` is optional and disabled. OpenRouter is not the
 public default.
 
+`controller_openrouter_free` is a separate strict-free candidate. It rejects
+the random `openrouter/free` meta-router, filters the live catalog to zero-price
+text models with `tools` and `tool_choice`, and supplies an ordered server-side
+`models` fallback list. Catalog refresh may add new eligible models at the tail
+or remove retired/paid models; promotion ahead of the proven primary remains a
+versioned quality decision.
+
 ### Local models
 
 `controller_vllm_gemma4` is a template for an OpenAI-compatible local endpoint.

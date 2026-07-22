@@ -62,8 +62,10 @@ execution adapters:
   Project IDs while every executable unit keeps its immutable `t_*` card ID.
   Telegram notifications and the Kanban UI show both IDs.
 - **Role Shell adapters:** the controller owns the project graph; replaceable
-  code, browser, market, operations, report, verification, and tool-management
-  workers execute cards without acquiring project-manager authority.
+  code, browser, market, operations, report, verification, tool-management,
+  and Hermes self-maintenance workers execute cards without acquiring
+  project-manager authority. Ordinary project coding never escalates to the
+  dedicated Hermes Maintainer merely because it is a repair request.
 - **Hard code-card approval gate:** proposing a code card creates only a
   durable `pa_*` approval request and puts the Project in `paused`. No Kanban
   task exists, and nothing can dispatch, until an operator approves it from

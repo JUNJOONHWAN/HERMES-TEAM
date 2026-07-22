@@ -22,9 +22,10 @@ You are Hermes, the fixed lightweight central control tower. You are not a
 general coding, research, market-analysis, or operations worker.
 
 Your permanent architecture:
-- The controller is one control slot. Seven immutable role shells are the
+- The controller is one control slot. Eight immutable role shells are the
   other slots: browser-research, code, market, operations, report,
-  verification, and tool-management (Multitool).
+  verification, tool-management (Multitool), and hermes-repair (Hermes
+  Maintainer).
 - Role shells are durable identities and Kanban ownership boundaries, not
   model processes. Real executors bind many-to-many: one executor may serve
   several shells, and a shell may have a primary plus candidate executors.
@@ -58,13 +59,20 @@ Operating rules:
    cards, pass their exact ids as source_task_ids. This creates non-blocking
    audited lineage and injects their runs/comments into the verifier prompt;
    do not create another recovery card merely because a source stayed blocked.
-2. Bug diagnosis, code changes, incident repair, runtime remediation, and
-   automation repair are repair work. Call supervisor_delegate with
-   work_kind="repair", shell_key="code" or "operations", and
-   the configured repair executor. Never inspect files, logs, processes,
-   repositories, or cron storage yourself. The tool enforces that health-gated
-   executor even if you omit or contradict the executor id. The public default
-   is the provider-neutral universal worker; Codex is an optional adapter.
+2. Ordinary project bug diagnosis, code changes, incident repair, runtime
+   remediation, and automation repair are normal repair work. Call
+   supervisor_delegate with work_kind="repair", shell_key="code" or
+   "operations", and the configured ordinary repair executor. These tasks may
+   continue to use lower-cost workers. Hermes self-maintenance is different:
+   only when the target is Hermes itself--its controller, adapters, role shells,
+   routing, supervisor configuration, or Hermes runtime contract--call
+   supervisor_delegate with work_kind="hermes_repair" and
+   shell_key="hermes-repair". That route is pinned to the dedicated
+   gpt-5.6-sol/high Maintainer and may analyze exact source_task_ids before
+   changing Hermes code or configuration. Never route generic project coding to
+   hermes-repair merely because the operator is speaking to Hermes. Never
+   inspect files, logs, processes, repositories, or cron storage yourself. The
+   tool enforces both boundaries even if you omit or contradict the executor id.
    Tool, skill, plugin, or MCP inventory/installation/assignment requests are
    not controller work: delegate them to shell_key="tool-management". That
    worker must keep assignments role-scoped and hand source/service/secret
@@ -149,6 +157,16 @@ _REPAIR_REQUEST = re.compile(
     r"(?:수선|수정|고쳐|고치|복구|장애|버그|오류|문제\s*해결|"
     r"작동(?:이|을)?\s*안|안\s*(?:돼|되|되는|됨)|"
     r"\b(?:repair|fix|debug|bug|incident|restore|recover|remediat(?:e|ion)|hotfix)\b)",
+    re.IGNORECASE,
+)
+_HERMES_SELF_MAINTENANCE_TARGET = re.compile(
+    r"(?:"
+    r"헤르메스(?:를|의|자체)|"
+    r"헤르메스\s*(?:컨트롤러|어댑터|셸|쉘|라우터|확장|설정|런타임|"
+    r"수퍼바이저|슈퍼바이저|감독|제어부)|"
+    r"\bHermes(?:\s+itself|'s|\s+(?:controller|adapter|role\s*shell|shell|"
+    r"router|extension|config(?:uration)?|runtime|supervisor|control\s*plane))"
+    r")",
     re.IGNORECASE,
 )
 _ADAPTER_REQUEST = re.compile(
@@ -236,6 +254,16 @@ def supervisor_repair_delegation_required(user_message: str) -> bool:
     if lowered.startswith("[kanban]") or lowered.startswith("cronjob response:"):
         return False
     return _REPAIR_REQUEST.search(text) is not None
+
+
+def supervisor_hermes_repair_delegation_required(user_message: str) -> bool:
+    """Return whether the repair target is Hermes itself, not project code."""
+    text = str(user_message or "").strip()
+    return bool(
+        text
+        and supervisor_repair_delegation_required(text)
+        and _HERMES_SELF_MAINTENANCE_TARGET.search(text)
+    )
 
 
 def supervisor_tool_management_delegation_required(user_message: str) -> bool:
@@ -441,17 +469,24 @@ def normalize_supervisor_repair_delegation(
         return normalized, False
     if str(tool_name or "").strip() != "supervisor_delegate":
         return normalized, False
-    normalized["work_kind"] = "repair"
+    hermes_repair = supervisor_hermes_repair_delegation_required(user_message)
+    if hermes_repair:
+        normalized["shell_key"] = "hermes-repair"
+        normalized["work_kind"] = "hermes_repair"
+    else:
+        normalized["work_kind"] = "repair"
     # Branch names only have meaning for an explicit worktree workspace.  A
     # controller model may still populate the optional field while delegating
     # the normal scratch repair card; passing that combination through makes
     # the otherwise valid repair fail before a card is created.
     if str(normalized.get("workspace_kind") or "scratch").strip() != "worktree":
         normalized.pop("branch_name", None)
-    eligible = str(normalized.get("shell_key") or "").strip() in {
-        "code",
-        "operations",
-    }
+    eligible = (
+        str(normalized.get("shell_key") or "").strip() == "hermes-repair"
+        if hermes_repair
+        else str(normalized.get("shell_key") or "").strip()
+        in {"code", "operations"}
+    )
     return normalized, eligible
 
 

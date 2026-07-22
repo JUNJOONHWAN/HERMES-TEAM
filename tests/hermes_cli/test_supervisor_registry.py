@@ -121,6 +121,118 @@ def test_many_to_many_bindings_allow_executor_reuse_and_shell_candidates(tmp_pat
     assert {b1.id, b2.id, b3.id}
 
 
+def test_hermes_maintainer_runtime_and_replacement_certification_fail_closed(tmp_path):
+    conn = _conn(tmp_path)
+    runtime = {
+        "provider": "openai-codex",
+        "model": "gpt-5.6-sol",
+        "api_mode": "codex_app_server",
+        "reasoning_effort": "high",
+    }
+    shell = sr.register_shell_version(
+        conn,
+        shell_key="hermes-repair",
+        name="Hermes Maintainer",
+        contract={
+            "allowed_adapters": ["command"],
+            "runtime_requirements": runtime,
+            "replacement_gate": {
+                "baseline_executor_id": "executor_baseline",
+                "baseline_runtime": runtime,
+                "minimum_cases": 20,
+                "minimum_overall_pass_rate": 0.95,
+                "critical_pass_rate": 1.0,
+                "maximum_default_branch_writes": 0,
+                "require_operator_approval": True,
+                "require_conflicting_adapter_result_case": True,
+                "require_config_and_source_cases": True,
+                "require_branch_push_and_rollback": True,
+                "require_timeline_invalid_count": 0,
+            },
+        },
+        required_capabilities=("file", "terminal", "kanban"),
+        allowed_capabilities=("file", "terminal", "kanban"),
+        evidence_policy={"timeline_required": True},
+    )
+    baseline = sr.register_executor(
+        conn,
+        executor_id="executor_baseline",
+        name="baseline",
+        adapter_type="command",
+        launch_config={
+            **runtime,
+            "argv": ["true", "{prompt_file}"],
+            "capability_enforcement": "env",
+        },
+        capabilities=("file", "terminal", "kanban"),
+        heartbeat_required=False,
+    )
+    assert sr.assign_adapter(
+        conn, shell_value=shell.id, executor_value=baseline.id
+    ).executor_id == baseline.id
+
+    uncertified = sr.register_executor(
+        conn,
+        executor_id="executor_candidate",
+        name="candidate",
+        adapter_type="command",
+        launch_config={
+            **runtime,
+            "argv": ["true", "{prompt_file}"],
+            "capability_enforcement": "env",
+        },
+        capabilities=("file", "terminal", "kanban"),
+        heartbeat_required=False,
+    )
+    with pytest.raises(sr.SupervisorRegistryError, match="certification is required"):
+        sr.assign_adapter(
+            conn, shell_value=shell.id, executor_value=uncertified.id
+        )
+
+    certified_launch = {
+        **runtime,
+        "argv": ["true", "{prompt_file}"],
+        "capability_enforcement": "env",
+        "hermes_repair_certification": {
+            "operator_approved": True,
+            "case_count": 20,
+            "overall_pass_rate": 0.95,
+            "critical_pass_rate": 1.0,
+            "default_branch_writes": 0,
+            "timeline_invalid_count": 0,
+            "conflicting_adapter_result_case": True,
+            "config_and_source_cases": True,
+            "branch_push_and_rollback": True,
+        },
+    }
+    certified = sr.register_executor(
+        conn,
+        executor_id="executor_certified",
+        name="certified",
+        adapter_type="command",
+        launch_config=certified_launch,
+        capabilities=("file", "terminal", "kanban"),
+        heartbeat_required=False,
+    )
+    assert sr.assign_adapter(
+        conn, shell_value=shell.id, executor_value=certified.id
+    ).executor_id == certified.id
+
+    wrong_model = sr.register_executor(
+        conn,
+        executor_id="executor_wrong_model",
+        name="wrong-model",
+        adapter_type="command",
+        launch_config={**certified_launch, "model": "cheap-code-model"},
+        capabilities=("file", "terminal", "kanban"),
+        heartbeat_required=False,
+    )
+    with pytest.raises(sr.SupervisorRegistryError, match="runtime requirement mismatch"):
+        sr.assign_adapter(
+            conn, shell_value=shell.id, executor_value=wrong_model.id
+        )
+
+
 def test_primary_owner_precedes_higher_priority_candidates(tmp_path):
     conn = _conn(tmp_path)
     shell = _shell(conn)
@@ -645,6 +757,115 @@ def test_controller_health_gate_requires_real_tool_call_when_declared(
     assert rejected["enabled"] is False
     assert rejected["health_state"] == "unhealthy"
     assert rejected["health_gate"]["tool_smoke_passed"] is False
+
+
+def test_openrouter_free_health_refreshes_ordered_live_catalog_once(
+    tmp_path, monkeypatch
+):
+    conn = _conn(tmp_path)
+    primary = bootstrap.OPENROUTER_FREE_MODEL_PRIORITY[0]
+    secondary = bootstrap.OPENROUTER_FREE_MODEL_PRIORITY[2]
+    discovered = "vendor/new-tool-model:free"
+    adapter = sr.upsert_controller_adapter(
+        conn,
+        controller_adapter_id="controller_openrouter_free_test",
+        name="OpenRouter Free",
+        provider="openrouter",
+        model=primary,
+        base_url="https://openrouter.ai/api/v1",
+        health_url="https://openrouter.ai/api/v1/models",
+        key_env="OPENROUTER_API_KEY",
+        metadata={
+            "require_model_in_catalog": True,
+            "require_tool_smoke": True,
+            "tool_smoke_choice": "auto",
+            "dynamic_free_model_fallback": True,
+            "openrouter_free_router": True,
+            "server_side_model_fallback": True,
+            "free_model_suffix": ":free",
+            "model_fallback_candidates": [primary, secondary],
+        },
+    )
+    monkeypatch.setenv("OPENROUTER_API_KEY", "test-secret")
+
+    def row(model_id, **overrides):
+        payload = {
+            "id": model_id,
+            "pricing": {"prompt": "0", "completion": "0"},
+            "supported_parameters": ["tools", "tool_choice"],
+            "architecture": {"output_modalities": ["text"]},
+            "context_length": 100_000,
+        }
+        payload.update(overrides)
+        return payload
+
+    class Response:
+        status = 200
+
+        def __init__(self, payload):
+            self.payload = payload
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def read(self, _limit):
+            return json.dumps(self.payload).encode()
+
+    smoke_payloads = []
+
+    def openrouter_urlopen(request, timeout):
+        assert timeout == 5.0
+        if request.full_url.endswith("/models"):
+            return Response(
+                {
+                    "data": [
+                        row(discovered),
+                        row(secondary),
+                        row(primary),
+                        row("vendor/paid:free", pricing={"prompt": "0.1", "completion": "0"}),
+                        row("vendor/no-tools:free", supported_parameters=[]),
+                    ]
+                }
+            )
+        payload = json.loads(request.data)
+        smoke_payloads.append(payload)
+        return Response(
+            {
+                "model": secondary,
+                "choices": [
+                    {
+                        "message": {
+                            "tool_calls": [
+                                {"function": {"name": "hermes_health"}}
+                            ]
+                        }
+                    }
+                ],
+            }
+        )
+
+    monkeypatch.setattr(sr, "urlopen", openrouter_urlopen)
+    state = sr.set_controller_adapter_operational_state(
+        conn, adapter.id, enabled=True, changed_by="test"
+    )
+    assert state["enabled"] is True
+    assert len(smoke_payloads) == 1
+    assert smoke_payloads[0]["model"] == primary
+    assert smoke_payloads[0]["models"] == [secondary, discovered]
+    assert smoke_payloads[0]["provider"] == {
+        "allow_fallbacks": True,
+        "require_parameters": True,
+    }
+    refreshed = sr.get_controller_adapter(conn, adapter.id)
+    assert refreshed is not None
+    assert refreshed.metadata["model_fallback_candidates"] == [
+        primary,
+        secondary,
+        discovered,
+    ]
 
 
 def test_controller_health_gate_selects_tool_capable_free_fallback(
@@ -1801,6 +2022,75 @@ def test_supervisor_repair_delegation_is_pinned_to_configured_executor(
     assert "repair work is pinned" in rejected
 
 
+def test_hermes_self_maintenance_has_a_distinct_pinned_shell_and_executor(
+    tmp_path, monkeypatch
+):
+    home = tmp_path / "home"
+    home.mkdir()
+    maintainer_id = "executor_hermes_worker_hermes_maintainer"
+    (home / "config.yaml").write_text(
+        yaml.safe_dump(
+            {
+                "supervisor": {
+                    "enabled": True,
+                    "repair_executor_id": "executor_hermes_worker_universal",
+                    "hermes_repair_executor_id": maintainer_id,
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    kb.init_db()
+    with kb.connect_closing() as conn:
+        shell = _shell(conn, "hermes-repair")
+        _shell(conn, "code")
+        maintainer = _executor(conn, maintainer_id)
+        sr.bind_executor(
+            conn,
+            shell_id=shell.id,
+            executor_id=maintainer.id,
+            priority=100,
+            responsibility="primary",
+        )
+
+    delegated = json.loads(
+        supervisor_tools._handle_delegate(
+            {
+                "shell_key": "hermes-repair",
+                "title": "repair Hermes adapter routing",
+                "work_kind": "hermes_repair",
+            },
+            session_id="telegram-session",
+        )
+    )
+    assert delegated["shell_key"] == "hermes-repair"
+    assert delegated["work_kind"] == "hermes_repair"
+    assert delegated["requested_executor_id"] == maintainer_id
+    assert delegated["executor_selection"] == "pinned_hermes_maintainer"
+    assert delegated["routing_policy"] == "dedicated_hermes_maintainer_required"
+
+    ordinary_on_maintainer = supervisor_tools._handle_delegate(
+        {
+            "shell_key": "hermes-repair",
+            "title": "ordinary project code fix",
+            "work_kind": "repair",
+        },
+        session_id="telegram-session",
+    )
+    assert "ordinary code repair stays on code or operations" in ordinary_on_maintainer
+
+    hermes_on_code = supervisor_tools._handle_delegate(
+        {
+            "shell_key": "code",
+            "title": "Hermes adapter repair",
+            "work_kind": "hermes_repair",
+        },
+        session_id="telegram-session",
+    )
+    assert "must use the hermes-repair role shell" in hermes_on_code
+
+
 def test_nested_recovery_source_is_flattened_to_original_card(tmp_path):
     conn = _conn(tmp_path)
     source_id = kb.create_task(
@@ -2262,6 +2552,15 @@ def test_bootstrap_config_plan_removes_root_mcp_and_partitions_executor_profiles
     assert plan["root"]["supervisor"]["repair_executor_id"] == (
         bootstrap.DEFAULT_REPAIR_EXECUTOR_ID
     )
+    assert plan["root"]["supervisor"]["hermes_repair_executor_id"] == (
+        bootstrap.DEFAULT_HERMES_REPAIR_EXECUTOR_ID
+    )
+    maintainer = plan["profiles"]["hermes-worker-hermes-maintainer"]
+    assert maintainer["model"]["provider"] == "openai-codex"
+    assert maintainer["model"]["default"] == "gpt-5.6-sol"
+    assert maintainer["model"]["openai_runtime"] == "codex_app_server"
+    assert maintainer["model"]["api_mode"] == "codex_app_server"
+    assert maintainer["agent"]["reasoning_effort"] == "high"
     assert bootstrap.HEARTBEAT_DELIVERY == "local"
     assert plan["root"]["supervisor"]["required_cron"] == [
         "hermes-supervisor-heartbeat"
@@ -2850,7 +3149,7 @@ def test_conversational_adapter_tool_lists_switches_and_inspects(tmp_path, monke
 
     listed = json.loads(supervisor_tools._handle_adapter({"action": "list"}))
     assert listed["view"] == "operator_compact"
-    assert listed["role_adapter_count"] == 7
+    assert listed["role_adapter_count"] == 8
     code_adapter = next(
         row for row in listed["role_adapters"] if row["adapter"] == "code"
     )
@@ -2866,7 +3165,8 @@ def test_conversational_adapter_tool_lists_switches_and_inspects(tmp_path, monke
     assert listed["operator_text"].startswith("Hermes: ")
     assert "├ 브라우저:" in listed["operator_text"]
     assert "├ 검증:" in listed["operator_text"]
-    assert "└ 멀티툴:" in listed["operator_text"]
+    assert "├ 멀티툴:" in listed["operator_text"]
+    assert "└ Hermes 수선:" in listed["operator_text"]
     assert "executor_codex" not in listed["operator_text"]
     assert "hermes-worker-" not in listed["operator_text"]
     assert "사용 중" not in listed["operator_text"]
@@ -2874,7 +3174,7 @@ def test_conversational_adapter_tool_lists_switches_and_inspects(tmp_path, monke
     assert "대기:" not in listed["operator_text"]
     assert "컨트롤러 폴백" in listed["operator_text"]
     assert "변경: Hermes 판단 모델만" in listed["operator_text"]
-    assert "유지: 역할 7개 연결" in listed["operator_text"]
+    assert "유지: 역할 8개 연결" in listed["operator_text"]
     assert "범위: MCP·스킬·툴 등록" in listed["operator_text"]
     assert "범위: 지정 소스 수정·테스트" in listed["operator_text"]
     assert "툴: File·Terminal·Timeline" in listed["operator_text"]
@@ -3345,12 +3645,12 @@ def test_supervisor_install_is_idempotent_in_isolated_home(tmp_path):
 
     conn = sqlite3.connect(home / "kanban.db")
     try:
-        assert conn.execute("SELECT COUNT(*) FROM role_shells").fetchone()[0] == 7
-        assert conn.execute("SELECT COUNT(*) FROM executors").fetchone()[0] == 5
-        assert conn.execute("SELECT COUNT(*) FROM role_bindings").fetchone()[0] == 18
+        assert conn.execute("SELECT COUNT(*) FROM role_shells").fetchone()[0] == 8
+        assert conn.execute("SELECT COUNT(*) FROM executors").fetchone()[0] == 6
+        assert conn.execute("SELECT COUNT(*) FROM role_bindings").fetchone()[0] == 19
         assert conn.execute(
             "SELECT COUNT(*) FROM controller_adapters"
-        ).fetchone()[0] == 5
+        ).fetchone()[0] == 6
         assert conn.execute(
             "SELECT health_state FROM controller_adapters WHERE id='controller_codex'"
         ).fetchone()[0] == "unknown"
@@ -3384,11 +3684,24 @@ def test_supervisor_install_is_idempotent_in_isolated_home(tmp_path):
         ]
         assert json.loads(opencode_free[5])["free_model_ids"] == ["big-pickle"]
         assert json.loads(opencode_free[5])["tool_smoke_choice"] == "auto"
+        openrouter_free = conn.execute(
+            "SELECT provider,model,key_env,metadata_json FROM controller_adapters "
+            "WHERE id='controller_openrouter_free'"
+        ).fetchone()
+        assert openrouter_free is not None
+        assert tuple(openrouter_free[:3]) == (
+            "openrouter",
+            bootstrap.OPENROUTER_FREE_MODEL_PRIORITY[0],
+            "OPENROUTER_API_KEY",
+        )
+        openrouter_free_metadata = json.loads(openrouter_free[3])
+        assert openrouter_free_metadata["openrouter_free_router"] is True
+        assert openrouter_free_metadata["server_side_model_fallback"] is True
         assert conn.execute(
             "SELECT key_env FROM controller_adapters WHERE id='controller_grok'"
         ).fetchone()[0] == "XAI_API_KEY"
         assert conn.execute(
             "SELECT COUNT(*) FROM role_bindings WHERE responsibility='primary'"
-        ).fetchone()[0] == 7
+        ).fetchone()[0] == 8
     finally:
         conn.close()

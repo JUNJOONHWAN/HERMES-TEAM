@@ -434,3 +434,59 @@ def test_opencode_controller_runtime_has_model_then_codex_fallbacks(monkeypatch)
             "api_key": "no-key-required",
         }
     ]
+
+
+def test_openrouter_free_controller_uses_ordered_server_side_fallbacks(monkeypatch):
+    adapter = types.SimpleNamespace(
+        provider="openrouter",
+        model="vendor/strong:free",
+        base_url="https://openrouter.ai/api/v1",
+        api_mode="chat_completions",
+        key_env="OPENROUTER_API_KEY",
+        metadata={
+            "server_side_model_fallback": True,
+            "model_fallback_candidates": [
+                "vendor/strong:free",
+                "vendor/next:free",
+                "vendor/last:free",
+            ],
+        },
+    )
+    monkeypatch.setenv("OPENROUTER_API_KEY", "test-key")
+
+    import hermes_cli.runtime_provider as runtime_provider
+
+    monkeypatch.setattr(
+        runtime_provider,
+        "resolve_runtime_provider",
+        lambda **kwargs: {
+            "api_key": kwargs["explicit_api_key"],
+            "base_url": kwargs["explicit_base_url"],
+            "provider": kwargs["requested"],
+            "api_mode": "chat_completions",
+            "command": None,
+            "args": [],
+            "credential_pool": None,
+        },
+    )
+
+    runtime = gateway_run.GatewayRunner._resolve_controller_candidate_runtime(
+        adapter
+    )
+    assert runtime["request_overrides"] == {
+        "extra_body": {
+            "models": ["vendor/next:free", "vendor/last:free"],
+            "provider": {
+                "allow_fallbacks": True,
+                "require_parameters": True,
+            },
+        }
+    }
+    assert gateway_run.GatewayRunner._controller_model_fallback_entries(adapter) == []
+
+    runner = object.__new__(gateway_run.GatewayRunner)
+    runner._service_tier = None
+    route = runner._resolve_turn_agent_config(
+        "hello", adapter.model, runtime
+    )
+    assert route["request_overrides"] == runtime["request_overrides"]

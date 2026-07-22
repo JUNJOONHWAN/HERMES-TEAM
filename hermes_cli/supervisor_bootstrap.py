@@ -23,6 +23,7 @@ import yaml
 from hermes_cli import kanban_db as kb
 from hermes_cli import supervisor_registry as registry
 from hermes_cli.opencode_free_router import FREE_MODEL_PRIORITY
+from hermes_cli.openrouter_free_router import OPENROUTER_FREE_MODEL_PRIORITY
 from utils import atomic_replace, atomic_yaml_write
 
 
@@ -31,6 +32,7 @@ HEARTBEAT_JOB_NAME = "hermes-supervisor-heartbeat"
 HEARTBEAT_SCHEDULE = "0 * * * *"
 HEARTBEAT_DELIVERY = "local"
 DEFAULT_REPAIR_EXECUTOR_ID = "executor_hermes_worker_universal"
+DEFAULT_HERMES_REPAIR_EXECUTOR_ID = "executor_hermes_worker_hermes_maintainer"
 ROOT_TOOLSETS = ["supervisor", "kanban", "cronjob", "no_mcp"]
 OPENROUTER_GEMMA_MODEL = "google/gemma-4-31b-it"
 LOCAL_VLLM_GEMMA_MODEL = "google/gemma-4-26b-a4b-it"
@@ -93,6 +95,22 @@ PROFILE_SPECS: dict[str, dict[str, Any]] = {
         "mcp_servers": [TIMELINE_MCP],
         "capabilities": [
             "file", "terminal", "web", "skills", "kanban", TIMELINE_MCP,
+        ],
+        "capacity": 1,
+    },
+    "hermes-worker-hermes-maintainer": {
+        "description": (
+            "Hermes self-maintenance executor for controller, adapter, role-shell, "
+            "routing, supervisor configuration, and Hermes runtime contract repair."
+        ),
+        "provider": "openai-codex",
+        "model": "gpt-5.6-sol",
+        "openai_runtime": "codex_app_server",
+        "api_mode": "codex_app_server",
+        "reasoning_effort": "high",
+        "mcp_servers": [TIMELINE_MCP],
+        "capabilities": [
+            "file", "terminal", "kanban", TIMELINE_MCP,
         ],
         "capacity": 1,
     },
@@ -230,6 +248,53 @@ ROLE_SPECS: dict[str, dict[str, Any]] = {
             "rollback evidence, and any capability_missing handoff in the receipt."
         ),
     },
+    "hermes-repair": {
+        "name": "Hermes Maintainer",
+        "description": (
+            "Hermes self-maintenance only; ordinary project coding and repair stay "
+            "on the code or operations shells."
+        ),
+        "required": ["file", "terminal", "kanban", TIMELINE_MCP],
+        "allowed": PROFILE_SPECS["hermes-worker-hermes-maintainer"]["capabilities"],
+        "code_slice_required": True,
+        "instructions": (
+            "Maintain Hermes itself only: its controller, adapters, role shells, "
+            "routing, supervisor configuration, and Hermes runtime contracts. "
+            "Never take ordinary product code creation or generic project bug repair; "
+            "those remain code/operations work and may use lower-cost executors. Read "
+            "the exact source_task_ids, runs, comments, receipts, and Timeline evidence "
+            "from other adapters, distinguish claims from reproduced facts, and record "
+            "a before-change impact report. Modify only the named Hermes repository or "
+            "runtime configuration, run risk-proportional tests, and record the actual "
+            "after-change impact. Commit and push only the task's non-default branch; "
+            "never push main, master, or another default branch and never merge or "
+            "promote a release without a separate explicit operator action."
+        ),
+        "runtime_requirements": {
+            "provider": "openai-codex",
+            "model": "gpt-5.6-sol",
+            "api_mode": "codex_app_server",
+            "reasoning_effort": "high",
+        },
+        "replacement_gate": {
+            "baseline_executor_id": DEFAULT_HERMES_REPAIR_EXECUTOR_ID,
+            "baseline_runtime": {
+                "provider": "openai-codex",
+                "model": "gpt-5.6-sol",
+                "api_mode": "codex_app_server",
+                "reasoning_effort": "high",
+            },
+            "minimum_cases": 20,
+            "minimum_overall_pass_rate": 0.95,
+            "critical_pass_rate": 1.0,
+            "maximum_default_branch_writes": 0,
+            "require_operator_approval": True,
+            "require_conflicting_adapter_result_case": True,
+            "require_config_and_source_cases": True,
+            "require_branch_push_and_rollback": True,
+            "require_timeline_invalid_count": 0,
+        },
+    },
 }
 
 
@@ -252,6 +317,7 @@ BINDING_SPECS = [
     ("verification", "hermes-worker-universal", 5),
     ("tool-management", "hermes-worker-multitool", 100),
     ("tool-management", "hermes-worker-universal", 5),
+    ("hermes-repair", "hermes-worker-hermes-maintainer", 100),
 ]
 
 
@@ -293,6 +359,7 @@ def _root_config(current: dict[str, Any]) -> dict[str, Any]:
         "enabled": True,
         "schema_version": 1,
         "repair_executor_id": DEFAULT_REPAIR_EXECUTOR_ID,
+        "hermes_repair_executor_id": DEFAULT_HERMES_REPAIR_EXECUTOR_ID,
         "platforms": platforms,
         "expected_paused_cron": [],
         "expected_services": [],
@@ -327,10 +394,24 @@ def _profile_config(
     # Bound one-shot workers must see their MCP aliases on the first and only
     # turn. Give local/proxy discovery a bounded but practical startup window.
     config["mcp_discovery_timeout"] = 15.0
-    if spec.get("openai_runtime"):
+    if any(
+        spec.get(name)
+        for name in ("provider", "model", "openai_runtime", "api_mode")
+    ):
         model_config = dict(config.get("model") or {})
-        model_config["openai_runtime"] = str(spec["openai_runtime"])
+        if spec.get("provider"):
+            model_config["provider"] = str(spec["provider"])
+        if spec.get("model"):
+            model_config["default"] = str(spec["model"])
+        if spec.get("openai_runtime"):
+            model_config["openai_runtime"] = str(spec["openai_runtime"])
+        if spec.get("api_mode"):
+            model_config["api_mode"] = str(spec["api_mode"])
         config["model"] = model_config
+    if spec.get("reasoning_effort"):
+        agent_config = dict(config.get("agent") or {})
+        agent_config["reasoning_effort"] = str(spec["reasoning_effort"])
+        config["agent"] = agent_config
     config["toolsets"] = list(spec["capabilities"])
     config["platform_toolsets"] = {"cli": list(spec["capabilities"])}
     kanban = dict(config.get("kanban") or {})
@@ -604,6 +685,50 @@ def _install_registry(*, home: Path, controller_config: dict[str, Any]) -> dict[
             },
             initial_enabled=False,
         )
+        existing_openrouter_free = registry.get_controller_adapter(
+            conn, "controller_openrouter_free"
+        )
+        openrouter_free_model = (
+            existing_openrouter_free.model
+            if existing_openrouter_free is not None
+            and existing_openrouter_free.provider == "openrouter"
+            and existing_openrouter_free.model in OPENROUTER_FREE_MODEL_PRIORITY
+            else OPENROUTER_FREE_MODEL_PRIORITY[0]
+        )
+        openrouter_free = registry.upsert_controller_adapter(
+            conn,
+            controller_adapter_id="controller_openrouter_free",
+            name="OpenRouter strongest-free controller",
+            provider="openrouter",
+            model=openrouter_free_model,
+            base_url="https://openrouter.ai/api/v1",
+            api_mode="chat_completions",
+            reasoning_effort="medium",
+            key_env="OPENROUTER_API_KEY",
+            health_url="https://openrouter.ai/api/v1/models",
+            fallback_adapter_id=opencode_free.id,
+            description=(
+                "Strict zero-price, tool-capable OpenRouter route. Hermes orders "
+                "strong models first and OpenRouter performs same-request fallback."
+            ),
+            metadata={
+                "source": "direct_openrouter_free",
+                "delegation_only": True,
+                "require_model_in_catalog": True,
+                "require_tool_smoke": True,
+                "tool_smoke_choice": "auto",
+                "tool_smoke_max_tokens": 128,
+                "dynamic_free_model_fallback": True,
+                "openrouter_free_router": True,
+                "server_side_model_fallback": True,
+                "free_model_suffix": ":free",
+                "model_fallback_candidates": list(
+                    OPENROUTER_FREE_MODEL_PRIORITY
+                ),
+                "health_ttl_seconds": 21_600,
+            },
+            initial_enabled=False,
+        )
         grok = registry.upsert_controller_adapter(
             conn,
             controller_adapter_id="controller_grok",
@@ -657,6 +782,16 @@ def _install_registry(*, home: Path, controller_config: dict[str, Any]) -> dict[
                     "instructions": spec["instructions"],
                     "root_may_execute": False,
                     "executor_identity_does_not_widen_capabilities": True,
+                    **(
+                        {"runtime_requirements": spec["runtime_requirements"]}
+                        if spec.get("runtime_requirements")
+                        else {}
+                    ),
+                    **(
+                        {"replacement_gate": spec["replacement_gate"]}
+                        if spec.get("replacement_gate")
+                        else {}
+                    ),
                 },
                 required_capabilities=spec["required"],
                 allowed_capabilities=spec["allowed"],
@@ -670,13 +805,19 @@ def _install_registry(*, home: Path, controller_config: dict[str, Any]) -> dict[
             )
         for profile_name, spec in PROFILE_SPECS.items():
             executor_id = f"executor_{profile_name.replace('-', '_')}"
+            launch_config = {"profile": profile_name}
+            for runtime_key in (
+                "provider", "model", "api_mode", "reasoning_effort"
+            ):
+                if spec.get(runtime_key):
+                    launch_config[runtime_key] = spec[runtime_key]
             executors[profile_name] = registry.upsert_executor(
                 conn,
                 executor_id=executor_id,
                 name=profile_name,
                 description=spec["description"],
                 adapter_type="hermes_profile",
-                launch_config={"profile": profile_name},
+                launch_config=launch_config,
                 capabilities=spec["capabilities"],
                 capacity=int(spec["capacity"]),
                 heartbeat_required=False,
@@ -764,6 +905,7 @@ def _install_registry(*, home: Path, controller_config: dict[str, Any]) -> dict[
             opencode_free.id,
             codex.id,
             openrouter.id,
+            openrouter_free.id,
             grok.id,
             local_vllm.id,
         ],

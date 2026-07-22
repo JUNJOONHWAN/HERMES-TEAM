@@ -3815,6 +3815,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     @classmethod
     def _controller_model_fallback_entries(cls, adapter: Any) -> list[dict[str, Any]]:
         """Build same-provider model fallbacks before cross-provider failback."""
+        if adapter.metadata.get("server_side_model_fallback"):
+            return []
         configured = adapter.metadata.get("model_fallback_candidates") or []
         if not isinstance(configured, list):
             return []
@@ -3865,6 +3867,24 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         }
         if adapter.metadata.get("anonymous_api") and not resolved["api_key"]:
             resolved["api_key"] = "no-key-required"
+        if adapter.metadata.get("server_side_model_fallback"):
+            configured = adapter.metadata.get("model_fallback_candidates") or []
+            if not isinstance(configured, list):
+                configured = []
+            fallbacks: list[str] = []
+            for value in configured:
+                candidate = str(value or "").strip()
+                if candidate and candidate != adapter.model and candidate not in fallbacks:
+                    fallbacks.append(candidate)
+            extra_body: dict[str, Any] = {
+                "provider": {
+                    "allow_fallbacks": True,
+                    "require_parameters": True,
+                }
+            }
+            if fallbacks:
+                extra_body["models"] = fallbacks
+            resolved["request_overrides"] = {"extra_body": extra_body}
         return resolved
 
     def _apply_supervisor_controller_override(
@@ -3995,6 +4015,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             "credential_pool": runtime_kwargs.get("credential_pool"),
             "max_tokens": runtime_kwargs.get("max_tokens"),
         }
+        base_request_overrides = runtime_kwargs.get("request_overrides")
+        if not isinstance(base_request_overrides, dict):
+            base_request_overrides = {}
         route = {
             "model": model,
             "runtime": runtime,
@@ -4018,14 +4041,28 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         service_tier = getattr(self, "_service_tier", None)
         if not service_tier:
-            route["request_overrides"] = {}
+            route["request_overrides"] = dict(base_request_overrides)
             return route
 
         try:
             overrides = resolve_fast_mode_overrides(route["model"])
         except Exception:
             overrides = None
-        route["request_overrides"] = overrides or {}
+        merged_overrides = dict(base_request_overrides)
+        if isinstance(overrides, dict):
+            for key, value in overrides.items():
+                if (
+                    key == "extra_body"
+                    and isinstance(value, dict)
+                    and isinstance(merged_overrides.get(key), dict)
+                ):
+                    merged_overrides[key] = {
+                        **merged_overrides[key],
+                        **value,
+                    }
+                else:
+                    merged_overrides[key] = value
+        route["request_overrides"] = merged_overrides
         return route
 
     def _record_supervisor_controller_turn(

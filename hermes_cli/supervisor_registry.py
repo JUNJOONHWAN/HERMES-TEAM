@@ -22,6 +22,7 @@ from typing import Any, Iterable, Optional
 from urllib.parse import urlsplit
 from urllib.request import Request, urlopen
 
+from hermes_cli.openrouter_free_router import rank_openrouter_free_models
 from hermes_cli.sqlite_util import add_column_if_missing, write_txn
 
 
@@ -2213,6 +2214,9 @@ def probe_controller_adapter(
         dynamic_free = bool(
             adapter.metadata.get("dynamic_free_model_fallback", False)
         )
+        openrouter_free_router = bool(
+            adapter.metadata.get("openrouter_free_router", False)
+        )
         free_suffix = str(
             adapter.metadata.get("free_model_suffix") or "-free"
         )
@@ -2235,14 +2239,19 @@ def probe_controller_adapter(
         if not isinstance(configured_fallbacks, list):
             configured_fallbacks = []
         candidate_models: list[str] = []
-        for value in [adapter.model, *configured_fallbacks]:
-            candidate = str(value or "").strip()
-            if candidate and candidate not in candidate_models:
-                candidate_models.append(candidate)
-        if dynamic_free:
-            for candidate in sorted(model_ids):
-                if is_free_model(candidate) and candidate not in candidate_models:
+        if openrouter_free_router:
+            candidate_models = rank_openrouter_free_models(
+                rows if isinstance(rows, list) else []
+            )
+        else:
+            for value in [adapter.model, *configured_fallbacks]:
+                candidate = str(value or "").strip()
+                if candidate and candidate not in candidate_models:
                     candidate_models.append(candidate)
+            if dynamic_free:
+                for candidate in sorted(model_ids):
+                    if is_free_model(candidate) and candidate not in candidate_models:
+                        candidate_models.append(candidate)
         if model_ids:
             candidate_models = [
                 candidate for candidate in candidate_models if candidate in model_ids
@@ -2258,12 +2267,17 @@ def probe_controller_adapter(
                 "model_present": configured_model_present,
                 "configured_model_present": configured_model_present,
                 "catalog_model_count": len(model_ids),
-                "catalog_free_models": sorted(
-                    model_id
-                    for model_id in model_ids
-                    if is_free_model(model_id)
+                "catalog_free_models": (
+                    list(candidate_models)
+                    if openrouter_free_router
+                    else sorted(
+                        model_id
+                        for model_id in model_ids
+                        if is_free_model(model_id)
+                    )
                 ),
                 "candidate_models": candidate_models,
+                "model_fallback_candidates": candidate_models,
                 "reason": (
                     "health gate passed"
                     if healthy
@@ -2305,7 +2319,12 @@ def probe_controller_adapter(
                 )
                 smoke_attempts: list[dict[str, Any]] = []
                 selected_model = None
-                for candidate_model in candidate_models:
+                smoke_models = (
+                    [candidate_models[0]]
+                    if openrouter_free_router
+                    else candidate_models
+                )
+                for candidate_model in smoke_models:
                     smoke_payload = {
                         "model": candidate_model,
                         "messages": [
@@ -2337,6 +2356,13 @@ def probe_controller_adapter(
                         "max_tokens": tool_smoke_max_tokens,
                         "temperature": 0,
                     }
+                    if openrouter_free_router:
+                        if len(candidate_models) > 1:
+                            smoke_payload["models"] = candidate_models[1:]
+                        smoke_payload["provider"] = {
+                            "allow_fallbacks": True,
+                            "require_parameters": True,
+                        }
                     try:
                         smoke_request = Request(
                             completion_url,
@@ -2375,6 +2401,11 @@ def probe_controller_adapter(
                             else None
                         )
                         tool_name = None
+                        response_model = (
+                            str(smoke_parsed.get("model") or "").strip() or None
+                            if isinstance(smoke_parsed, dict)
+                            else None
+                        )
                         if isinstance(tool_calls, list) and tool_calls:
                             first_call = tool_calls[0]
                             function = (
@@ -2395,6 +2426,7 @@ def probe_controller_adapter(
                                 "model": candidate_model,
                                 "http_status": smoke_status,
                                 "tool_name": tool_name,
+                                "response_model": response_model,
                                 "passed": passed,
                             }
                         )
@@ -2405,6 +2437,7 @@ def probe_controller_adapter(
                                 "model": candidate_model,
                                 "http_status": getattr(smoke_exc, "code", None),
                                 "tool_name": None,
+                                "response_model": None,
                                 "passed": False,
                                 "reason": f"{type(smoke_exc).__name__}: {smoke_exc}",
                             }
@@ -2421,6 +2454,9 @@ def probe_controller_adapter(
                         "tool_smoke_passed": tool_smoke_passed,
                         "tool_smoke_http_status": selected_attempt.get("http_status"),
                         "tool_smoke_tool_name": selected_attempt.get("tool_name"),
+                        "tool_smoke_response_model": selected_attempt.get(
+                            "response_model"
+                        ),
                         "tool_smoke_attempts": smoke_attempts,
                         "selected_model": selected_model,
                         "model_switched": bool(
@@ -2494,13 +2530,31 @@ def set_controller_adapter_operational_state(
         selected_model if effective_enabled and selected_model else adapter.model
     )
     model_changed = effective_model != adapter.model
+    effective_metadata = dict(adapter.metadata)
+    refreshed_candidates = probe.get("model_fallback_candidates")
+    if (
+        effective_enabled
+        and effective_metadata.get("dynamic_free_model_fallback")
+        and isinstance(refreshed_candidates, list)
+        and refreshed_candidates
+    ):
+        effective_metadata["model_fallback_candidates"] = [
+            str(value)
+            for value in refreshed_candidates
+            if str(value or "").strip()
+        ]
+        effective_metadata["last_catalog_model_count"] = int(
+            probe.get("catalog_model_count") or 0
+        )
+        effective_metadata["last_catalog_refresh_at"] = probe.get("checked_at")
     health_state = "healthy" if effective_enabled else "disabled" if not enabled else "unhealthy"
     with write_txn(conn):
         conn.execute(
-            "UPDATE controller_adapters SET model=?,enabled=?,health_state=?,"
+            "UPDATE controller_adapters SET model=?,metadata_json=?,enabled=?,health_state=?,"
             "last_health_at=?,updated_at=? WHERE id=?",
             (
                 effective_model,
+                _canonical_json(effective_metadata),
                 int(effective_enabled),
                 health_state,
                 now,
@@ -2698,6 +2752,113 @@ def _static_executor_compatible(
     missing = sorted(set(shell.required_capabilities) - effective)
     if missing:
         return False, "missing required capabilities: " + ", ".join(missing)
+    runtime_compatible, runtime_reason = _executor_runtime_contract_compatible(
+        shell, executor
+    )
+    if not runtime_compatible:
+        return False, runtime_reason
+    return True, ""
+
+
+def _executor_runtime_contract_compatible(
+    shell: RoleShell,
+    executor: Executor,
+) -> tuple[bool, str]:
+    """Fail closed when a role shell pins a model/runtime or replacement gate."""
+    requirements = shell.contract.get("runtime_requirements")
+    if not isinstance(requirements, dict) or not requirements:
+        return True, ""
+    if executor.adapter_type == "hermes_profile":
+        runtime = executor_runtime_descriptor(executor)
+    else:
+        runtime = {
+            key: executor.launch_config.get(key)
+            for key in ("provider", "model", "api_mode", "reasoning_effort")
+        }
+    for key in ("provider", "model", "api_mode", "reasoning_effort"):
+        expected = str(requirements.get(key) or "").strip()
+        if not expected:
+            continue
+        actual = str(runtime.get(key) or "").strip()
+        if actual != expected:
+            return (
+                False,
+                f"runtime requirement mismatch for {key}: expected {expected!r}, "
+                f"got {actual!r}",
+            )
+
+    gate = shell.contract.get("replacement_gate")
+    if not isinstance(gate, dict) or not gate:
+        return True, ""
+    baseline_executor_id = str(gate.get("baseline_executor_id") or "").strip()
+    baseline_runtime = gate.get("baseline_runtime")
+    baseline_matches = executor.id == baseline_executor_id and isinstance(
+        baseline_runtime, dict
+    ) and all(
+        str(runtime.get(key) or "").strip()
+        == str(baseline_runtime.get(key) or "").strip()
+        for key in ("provider", "model", "api_mode", "reasoning_effort")
+    )
+    if baseline_matches:
+        return True, ""
+
+    certification = executor.launch_config.get("hermes_repair_certification")
+    if not isinstance(certification, dict):
+        return False, "Hermes maintainer replacement certification is required"
+    if gate.get("require_operator_approval") and not certification.get(
+        "operator_approved"
+    ):
+        return False, "Hermes maintainer replacement requires operator approval"
+    required_metrics = {
+        "case_count",
+        "overall_pass_rate",
+        "critical_pass_rate",
+        "default_branch_writes",
+        "timeline_invalid_count",
+    }
+    missing_metrics = sorted(required_metrics - set(certification))
+    if missing_metrics:
+        return False, (
+            "Hermes maintainer replacement certification missing metrics: "
+            + ", ".join(missing_metrics)
+        )
+    try:
+        case_count = int(certification.get("case_count") or 0)
+        overall_rate = float(certification.get("overall_pass_rate") or 0)
+        critical_rate = float(certification.get("critical_pass_rate") or 0)
+        default_branch_writes = int(
+            certification.get("default_branch_writes") or 0
+        )
+        timeline_invalid_count = int(
+            certification.get("timeline_invalid_count") or 0
+        )
+    except (TypeError, ValueError):
+        return False, "Hermes maintainer replacement certification is malformed"
+    if case_count < int(gate.get("minimum_cases") or 0):
+        return False, "Hermes maintainer replacement has insufficient eval cases"
+    if overall_rate < float(gate.get("minimum_overall_pass_rate") or 0):
+        return False, "Hermes maintainer replacement overall pass rate is too low"
+    if critical_rate < float(gate.get("critical_pass_rate") or 0):
+        return False, "Hermes maintainer replacement critical gate failed"
+    if default_branch_writes > int(
+        gate.get("maximum_default_branch_writes") or 0
+    ):
+        return False, "Hermes maintainer replacement wrote a default branch"
+    if timeline_invalid_count != int(
+        gate.get("require_timeline_invalid_count") or 0
+    ):
+        return False, "Hermes maintainer replacement Timeline gate failed"
+    required_flags = {
+        "require_conflicting_adapter_result_case": "conflicting_adapter_result_case",
+        "require_config_and_source_cases": "config_and_source_cases",
+        "require_branch_push_and_rollback": "branch_push_and_rollback",
+    }
+    for gate_key, certification_key in required_flags.items():
+        if gate.get(gate_key) and not certification.get(certification_key):
+            return False, (
+                "Hermes maintainer replacement certification missing "
+                + certification_key
+            )
     return True, ""
 
 
@@ -4139,6 +4300,11 @@ def _binding_eligible(
     if not effective:
         return None
     if not set(shell.required_capabilities).issubset(effective):
+        return None
+    runtime_compatible, _runtime_reason = _executor_runtime_contract_compatible(
+        shell, executor
+    )
+    if not runtime_compatible:
         return None
     return Selection(
         shell=shell,

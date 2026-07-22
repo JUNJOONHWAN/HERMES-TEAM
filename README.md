@@ -13,7 +13,7 @@ OpenAI-compatible endpoints, and generic CLIs are optional adapters.
 
 | Layer | Version |
 |---|---|
-| Hermes distribution family | `0.1.3` |
+| Hermes distribution family | `0.1.5` |
 | Hermes Agent engine | `0.18.0` |
 
 HERMES-CONTROL must use the same distribution version while retaining the separate engine version.
@@ -52,6 +52,35 @@ upstream Hermes releases can be integrated without a private compatibility
 fork.
 
 ## Upstream Hermes Agent
+
+## HERMES-TEAM control layer
+
+This distribution adds a native project and card control plane above Hermes'
+execution adapters:
+
+- **Project/Card Manager:** long-running work is grouped by stable `p_*`
+  Project IDs while every executable unit keeps its immutable `t_*` card ID.
+  Telegram notifications and the Kanban UI show both IDs.
+- **Role Shell adapters:** the controller owns the project graph; replaceable
+  code, browser, market, operations, report, verification, and tool-management
+  workers execute cards without acquiring project-manager authority.
+- **Hard code-card approval gate:** proposing a code card creates only a
+  durable `pa_*` approval request and puts the Project in `paused`. No Kanban
+  task exists, and nothing can dispatch, until an operator approves it from
+  Telegram or the web UI.
+- **Separate Project DB:** milestone, phase, card counts, pending approvals,
+  repository identity, commit SHA, push receipt, and Git events survive apart
+  from the Kanban execution ledger.
+- **Governed Git lifecycle:** project creation can use an existing repository,
+  initialize local Git, or create a private/public GitHub repository. Card
+  work is committed on isolated branches; workers cannot push `main` or
+  `master` directly.
+- **Replay-safe notifications:** new subscriptions begin at the current event
+  cursor, archived recovery predecessors are silent, and historical failures
+  are not replayed as a Telegram alert storm.
+
+See the [Korean supervisor operations guide](docs/HERMES_SUPERVISOR_OPERATIONS_KO.md)
+for the operating contract and examples.
 
 <p align="center">
   <a href="https://hermes-agent.nousresearch.com/">Hermes Agent</a> | <a href="https://hermes-agent.nousresearch.com/">Hermes Desktop</a>

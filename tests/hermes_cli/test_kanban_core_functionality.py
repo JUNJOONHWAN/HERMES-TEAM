@@ -548,6 +548,30 @@ def test_notify_sub_crud(kanban_home):
         conn.close()
 
 
+def test_notify_sub_starts_after_existing_event_history(kanban_home):
+    """A late subscription observes future transitions, not stale failures."""
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="old failure", assignee="w")
+        kb._append_event(conn, tid, "gave_up", {"error": "already handled"})
+        latest_event_id = int(conn.execute(
+            "SELECT MAX(id) AS value FROM task_events WHERE task_id = ?", (tid,),
+        ).fetchone()["value"])
+        kb.add_notify_sub(conn, task_id=tid, platform="telegram", chat_id="123")
+        sub = kb.list_notify_subs(conn, tid)[0]
+        assert int(sub["last_event_id"]) == latest_event_id
+        _, events = kb.unseen_events_for_sub(
+            conn,
+            task_id=tid,
+            platform="telegram",
+            chat_id="123",
+            kinds=["gave_up", "completed"],
+        )
+        assert events == []
+    finally:
+        conn.close()
+
+
 def test_notify_cursor_advances(kanban_home):
     conn = kb.connect()
     try:
@@ -587,6 +611,7 @@ def test_notify_claim_is_single_owner_and_rewindable(kanban_home):
     try:
         tid = kb.create_task(conn1, title="x", assignee="w")
         kb.add_notify_sub(conn1, task_id=tid, platform="telegram", chat_id="123")
+        initial_cursor = int(kb.list_notify_subs(conn1, tid)[0]["last_event_id"])
         kb.complete_task(conn1, tid, result="ok")
 
         old_cursor, claimed_cursor, events = kb.claim_unseen_events_for_sub(
@@ -596,7 +621,7 @@ def test_notify_claim_is_single_owner_and_rewindable(kanban_home):
             chat_id="123",
             kinds=["completed", "blocked"],
         )
-        assert old_cursor == 0
+        assert old_cursor == initial_cursor
         assert claimed_cursor > old_cursor
         assert [ev.kind for ev in events] == ["completed"]
 

@@ -1405,6 +1405,11 @@ def _handle_project_cards(args: dict[str, Any], **_kwargs) -> str:
                 input_refs=args.get("input_refs"),
                 priority=int(args.get("priority") or 0),
                 executor_id=(str(args.get("executor_id") or "").strip() or None),
+                milestone=(str(args.get("milestone") or "").strip() or None),
+                repo_mode=str(args.get("repo_mode") or "none"),
+                github_repo=(str(args.get("github_repo") or "").strip() or None),
+                repo_visibility=str(args.get("repo_visibility") or "private"),
+                default_branch=str(args.get("default_branch") or "main"),
                 **common,
             )
         elif action == "add_project_card":
@@ -1423,6 +1428,7 @@ def _handle_project_cards(args: dict[str, Any], **_kwargs) -> str:
                 ),
                 priority=int(args.get("priority") or 0),
                 executor_id=(str(args.get("executor_id") or "").strip() or None),
+                milestone=(str(args.get("milestone") or "").strip() or None),
                 **common,
             )
         elif action == "continue_card":
@@ -1441,6 +1447,7 @@ def _handle_project_cards(args: dict[str, Any], **_kwargs) -> str:
                 ),
                 priority=int(args.get("priority") or 0),
                 executor_id=(str(args.get("executor_id") or "").strip() or None),
+                milestone=(str(args.get("milestone") or "").strip() or None),
                 **common,
             )
         elif action == "split_card":
@@ -1471,7 +1478,40 @@ def _handle_project_cards(args: dict[str, Any], **_kwargs) -> str:
                     str(args.get("workspace_path") or "").strip() or None
                 ),
                 executor_id=(str(args.get("executor_id") or "").strip() or None),
+                milestone=(str(args.get("milestone") or "").strip() or None),
                 **common,
+            )
+        elif action == "list_code_card_approvals":
+            result = project_cards.list_code_card_approvals(
+                str(args.get("project_id") or ""),
+                include_decided=bool(args.get("include_decided", False)),
+            )
+        elif action == "approve_code_card":
+            result = project_cards.approve_code_card(
+                str(args.get("approval_id") or ""),
+                decided_by="telegram-operator" if session_id else "operator",
+                decision_reason=(str(args.get("reason") or "").strip() or None),
+            )
+        elif action == "reject_code_card":
+            result = project_cards.reject_code_card(
+                str(args.get("approval_id") or ""),
+                decided_by="telegram-operator" if session_id else "operator",
+                decision_reason=(str(args.get("reason") or "").strip() or None),
+            )
+        elif action == "configure_repository":
+            result = project_cards.configure_repository(
+                str(args.get("project_id") or ""),
+                mode=str(args.get("repo_mode") or "none"),
+                local_path=(str(args.get("primary_path") or "").strip() or None),
+                github_repo=(str(args.get("github_repo") or "").strip() or None),
+                visibility=str(args.get("repo_visibility") or "private"),
+                default_branch=str(args.get("default_branch") or "main"),
+            )
+        elif action == "checkpoint_card_git":
+            result = project_cards.checkpoint_card_git(
+                str(args.get("card_id") or ""),
+                message=(str(args.get("commit_message") or "").strip() or None),
+                push=bool(args.get("push", False)),
             )
         elif action == "inspect_card":
             result = project_cards.inspect_card(
@@ -1484,6 +1524,10 @@ def _handle_project_cards(args: dict[str, Any], **_kwargs) -> str:
             )
         elif action == "close_project":
             result = project_cards.close_project(
+                str(args.get("project_id") or "")
+            )
+        elif action == "pause_project":
+            result = project_cards.pause_project(
                 str(args.get("project_id") or "")
             )
         elif action == "reopen_project":
@@ -1979,8 +2023,11 @@ SUPERVISOR_PROJECT_SCHEMA = {
         "root card inside it, continue a completed or active card with a "
         "follow-up, split work into parallel role cards, "
         "create an independent verification card, recover failed work through "
-        "another compatible adapter, inspect/locate old cards, or close/reopen "
-        "a project. This is controller authority, not a worker adapter: workers "
+        "another compatible adapter, inspect/locate old cards, configure a "
+        "local or GitHub repository, checkpoint/push card branches, approve or "
+        "reject proposed code cards, or pause/close/reopen a project. New code cards "
+        "are proposals until an operator explicitly approves their pa_* id. "
+        "This is controller authority, not a worker adapter: workers "
         "execute the resulting immutable Role Shell cards and cannot mutate the "
         "project graph themselves. Completed cards stay immutable."
     ),
@@ -2001,13 +2048,20 @@ SUPERVISOR_PROJECT_SCHEMA = {
                     "inspect_project",
                     "locate_card",
                     "close_project",
+                    "pause_project",
                     "reopen_project",
+                    "list_code_card_approvals",
+                    "approve_code_card",
+                    "reject_code_card",
+                    "configure_repository",
+                    "checkpoint_card_git",
                 ],
             },
             "project_id": {"type": "string"},
             "project_name": {"type": "string"},
             "project_slug": {"type": "string"},
             "card_id": {"type": "string"},
+            "approval_id": {"type": "string"},
             "title": {"type": "string"},
             "body": {"type": "string"},
             "shell_key": {
@@ -2055,7 +2109,33 @@ SUPERVISOR_PROJECT_SCHEMA = {
                 },
             },
             "board": {"type": "string", "default": "default"},
+            "milestone": {
+                "type": "string",
+                "description": "Project milestone label such as M0 or M1.",
+            },
             "primary_path": {"type": "string"},
+            "repo_mode": {
+                "type": "string",
+                "enum": ["none", "existing", "init_local", "github"],
+                "default": "none",
+            },
+            "github_repo": {
+                "type": "string",
+                "description": "GitHub name or owner/name; project slug is the default.",
+            },
+            "repo_visibility": {
+                "type": "string",
+                "enum": ["private", "public"],
+                "default": "private",
+            },
+            "default_branch": {"type": "string", "default": "main"},
+            "commit_message": {"type": "string"},
+            "push": {
+                "type": "boolean",
+                "description": "Push only the card branch; default/main is refused.",
+                "default": False,
+            },
+            "reason": {"type": "string"},
             "workspace_kind": {
                 "type": "string",
                 "enum": ["scratch", "dir", "worktree"],
@@ -2064,6 +2144,7 @@ SUPERVISOR_PROJECT_SCHEMA = {
             "executor_id": {"type": "string"},
             "priority": {"type": "integer", "default": 0},
             "include_archived": {"type": "boolean", "default": False},
+            "include_decided": {"type": "boolean", "default": False},
         },
         "required": ["action"],
     },

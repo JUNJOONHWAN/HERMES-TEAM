@@ -8974,12 +8974,14 @@ def add_notify_sub(
         conn.execute(
             """
             INSERT OR IGNORE INTO kanban_notify_subs
-                (task_id, platform, chat_id, thread_id, user_id, notifier_profile, chat_type, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                (task_id, platform, chat_id, thread_id, user_id, notifier_profile,
+                 chat_type, created_at, last_event_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?,
+                    COALESCE((SELECT MAX(id) FROM task_events WHERE task_id = ?), 0))
             """,
             (
                 task_id, platform, chat_id, thread_id or "", user_id,
-                notifier_profile, chat_type, now,
+                notifier_profile, chat_type, now, task_id,
             ),
         )
         if notifier_profile:

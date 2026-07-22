@@ -132,6 +132,59 @@ def test_kanban_notifier_sends_complete_result_before_short_summary(tmp_path, mo
     assert "한국장·나스닥 선물 단기 요약" not in adapter.sent[0]["text"]
 
 
+def test_project_notification_always_shows_project_and_card_ids(tmp_path, monkeypatch):
+    db_path = tmp_path / "project-identity.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(
+            conn,
+            title="project result",
+            assignee="worker",
+        )
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET project_id = ? WHERE id = ?",
+                ("p_7e4d6ef5", tid),
+            )
+        kb.add_notify_sub(conn, task_id=tid, platform="telegram", chat_id="chat-1")
+        kb.complete_task(conn, tid, result="done")
+    finally:
+        conn.close()
+
+    adapter = RecordingAdapter()
+    asyncio.run(_run_one_notifier_tick(monkeypatch, _make_runner(adapter)))
+
+    assert len(adapter.sent) == 1
+    assert "프로젝트: p_7e4d6ef5" in adapter.sent[0]["text"]
+    assert f"카드: {tid}" in adapter.sent[0]["text"]
+
+
+def test_archived_card_suppresses_queued_failure_and_unsubscribes(tmp_path, monkeypatch):
+    db_path = tmp_path / "archived-supersedes-failure.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="old failed recovery", assignee="worker")
+        kb.add_notify_sub(conn, task_id=tid, platform="telegram", chat_id="chat-1")
+        kb._append_event(conn, tid, "gave_up", {"error": "stale failure"})
+        assert kb.archive_task(conn, tid) is True
+    finally:
+        conn.close()
+
+    adapter = RecordingAdapter()
+    asyncio.run(_run_one_notifier_tick(monkeypatch, _make_runner(adapter)))
+
+    assert adapter.sent == []
+    conn = kb.connect()
+    try:
+        assert kb.list_notify_subs(conn, tid) == []
+    finally:
+        conn.close()
+
+
 def test_completion_provenance_names_supervisor_role_executor_and_overrides(monkeypatch):
     class FakeConn:
         def execute(self, sql, _params):

@@ -172,3 +172,64 @@ def test_db_path_under_hermes_home():
     # Resolves under HERMES_HOME (set by the autouse isolation fixture).
     assert pdb.projects_db_path().name == "projects.db"
     assert os.path.basename(str(pdb.projects_db_path().parent))  # non-empty parent
+
+
+def test_project_progress_approval_and_git_state_are_separate_durable_tables(conn):
+    pid = pdb.create_project(conn, name="Governed")
+    assert pdb.set_project_status(conn, pid, "paused") is True
+    assert pdb.get_project(conn, pid).status == "paused"
+    progress = pdb.upsert_project_progress(
+        conn,
+        pid,
+        phase="awaiting_code_approval",
+        milestone="M2",
+        counts={"done": 3},
+    )
+    approval = pdb.create_card_approval(
+        conn,
+        project_id=pid,
+        action="add_project_card",
+        title="Implement M2",
+        shell_key="code",
+        request={"title": "Implement M2", "shell_key": "code"},
+        dedupe_key="same-proposal",
+        requested_by="controller",
+    )
+    duplicate = pdb.create_card_approval(
+        conn,
+        project_id=pid,
+        action="add_project_card",
+        title="Implement M2",
+        shell_key="code",
+        request={"title": "Implement M2", "shell_key": "code"},
+        dedupe_key="same-proposal",
+        requested_by="controller",
+    )
+    repository = pdb.upsert_project_repository(
+        conn,
+        pid,
+        mode="github",
+        provider="github",
+        local_path="/tmp/governed",
+        remote_name="owner/governed",
+        status="ready",
+        last_commit_sha="abc123",
+    )
+    event = pdb.record_git_event(
+        conn,
+        project_id=pid,
+        card_id="t_1",
+        event_type="card_committed",
+        branch="governed/t_1",
+        sha="abc123",
+        status="succeeded",
+    )
+
+    assert progress["phase"] == "awaiting_code_approval"
+    assert progress["milestone"] == "M2"
+    assert progress["counts"] == {"done": 3}
+    assert duplicate["id"] == approval["id"]
+    assert pdb.list_card_approvals(conn, pid)[0]["request"]["title"] == "Implement M2"
+    assert repository["last_commit_sha"] == "abc123"
+    assert pdb.get_project_repository(conn, pid)["remote_name"] == "owner/governed"
+    assert pdb.list_git_events(conn, pid)[0]["id"] == event["id"]

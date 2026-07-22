@@ -41,6 +41,16 @@ def _mark_status(task_id: str, status: str) -> None:
             conn.execute("UPDATE tasks SET status = ? WHERE id = ?", (status, task_id))
 
 
+def _approve_code_response(response: dict) -> dict:
+    assert response["card"] is None
+    assert response["approval_required"] is True
+    approval = response["approval_request"]
+    assert approval["status"] == "pending"
+    return controller.approve_code_card(
+        approval["id"], decided_by="test-operator"
+    )["card"]
+
+
 def test_controller_owns_project_and_card_thread_lifecycle(project_control_home):
     started = controller.start_project(
         name="Hermes Control",
@@ -50,10 +60,11 @@ def test_controller_owns_project_and_card_thread_lifecycle(project_control_home)
         input_refs=["spec:controller-v1"],
     )
     project = started["project"]
-    root = started["card"]
+    root = _approve_code_response(started)
+    assert controller.inspect_project(project["id"])["project"]["status"] == "active"
 
     assert started["schema"] == controller.SCHEMA
-    assert project["status"] == "active"
+    assert project["status"] == "paused"
     assert project["board_slug"] == "default"
     assert root["project_id"] == project["id"]
     assert root["root_task_id"] == root["id"]
@@ -159,10 +170,11 @@ def test_non_git_project_path_uses_durable_directory(project_control_home, tmp_p
         primary_path=str(project_dir),
     )
 
-    assert started["card"]["workspace_kind"] == "dir"
-    assert started["card"]["workspace_path"] == str(project_dir)
+    root = _approve_code_response(started)
+    assert root["workspace_kind"] == "dir"
+    assert root["workspace_path"] == str(project_dir)
     follow = controller.continue_card(
-        started["card"]["id"],
+        root["id"],
         title="Research an unresolved requirement",
         shell_key="browser",
     )["card"]
@@ -199,10 +211,11 @@ def test_git_project_path_keeps_code_cards_in_worktrees(
         primary_path=str(repo),
     )
 
-    assert started["card"]["workspace_kind"] == "worktree"
-    assert started["card"]["workspace_path"] == str(repo)
+    root = _approve_code_response(started)
+    assert root["workspace_kind"] == "worktree"
+    assert root["workspace_path"] == str(repo)
     with kb.connect_closing(board="default") as conn:
-        task = kb.get_task(conn, started["card"]["id"])
+        task = kb.get_task(conn, root["id"])
     assert task is not None
     resolved = kb.resolve_workspace(task, board="default")
     assert resolved == repo / ".worktrees" / task.id
@@ -220,7 +233,8 @@ def test_explicit_worktree_without_git_anchor_is_rejected_before_card_creation(
         shell_key="code",
         primary_path=str(project_dir),
     )
-    assert started["card"]["workspace_kind"] == "dir"
+    root = _approve_code_response(started)
+    assert root["workspace_kind"] == "dir"
     before = len(controller.inspect_project(started["project"]["id"])["cards"])
     with pytest.raises(
         controller.ProjectCardControllerError,
@@ -339,6 +353,161 @@ def test_supervisor_common_gateway_calls_native_controller(project_control_home)
         second["card"]["id"],
         recovered["id"],
     ]
+
+
+def test_code_card_requires_operator_approval_and_deduplicates(
+    project_control_home,
+):
+    started = controller.start_project(
+        name="Approval gate",
+        goal="Create guarded code work",
+        shell_key="operations",
+    )
+    project_id = started["project"]["id"]
+
+    first = controller.add_project_card(
+        project_id,
+        title="Implement M1",
+        shell_key="code",
+        milestone="M1",
+    )
+    replay = controller.add_project_card(
+        project_id,
+        title="Implement M1",
+        shell_key="code",
+        milestone="M1",
+    )
+
+    assert first["card"] is None
+    assert first["approval_required"] is True
+    assert replay["approval_request"]["id"] == first["approval_request"]["id"]
+    summary = controller.inspect_project(project_id)
+    assert summary["project"]["status"] == "paused"
+    assert summary["progress"]["phase"] == "awaiting_code_approval"
+    assert summary["progress"]["milestone"] == "M1"
+    assert [item["id"] for item in summary["approval_requests"]] == [
+        first["approval_request"]["id"]
+    ]
+    assert len(summary["cards"]) == 1
+
+    approved = controller.approve_code_card(
+        first["approval_request"]["id"],
+        decided_by="test-operator",
+    )
+    assert approved["card"]["project_id"] == project_id
+    assert approved["approval_request"]["status"] == "consumed"
+    assert controller.inspect_project(project_id)["project"]["status"] == "active"
+    repeated = controller.approve_code_card(
+        first["approval_request"]["id"],
+        decided_by="test-operator",
+    )
+    assert repeated["idempotent_replay"] is True
+    assert repeated["card"]["id"] == approved["card"]["id"]
+
+
+def test_rejecting_code_card_never_creates_task(project_control_home):
+    started = controller.start_project(
+        name="Reject gate",
+        goal="Operations root",
+        shell_key="operations",
+    )
+    requested = controller.add_project_card(
+        started["project"]["id"],
+        title="Do not create this code card",
+        shell_key="code",
+    )
+    rejected = controller.reject_code_card(
+        requested["approval_request"]["id"],
+        decided_by="test-operator",
+        decision_reason="not in scope",
+    )
+
+    assert rejected["card"] is None
+    assert rejected["approval_request"]["status"] == "rejected"
+    summary = controller.inspect_project(started["project"]["id"])
+    assert len(summary["cards"]) == 1
+    assert summary["project"]["status"] == "active"
+
+
+def test_operator_pause_is_a_durable_card_creation_gate(project_control_home):
+    started = controller.start_project(
+        name="Paused project",
+        goal="Operations root",
+        shell_key="operations",
+    )
+    project_id = started["project"]["id"]
+    paused = controller.pause_project(project_id)
+
+    assert paused["project"]["status"] == "paused"
+    assert paused["progress"]["phase"] == "paused"
+    with pytest.raises(controller.ProjectCardControllerError, match="paused"):
+        controller.add_project_card(
+            project_id,
+            title="Must not issue while paused",
+            shell_key="operations",
+        )
+    reopened = controller.reopen_project(project_id)
+    assert reopened["project"]["status"] == "active"
+
+
+def test_repository_init_and_card_branch_commit_push_are_project_audited(
+    project_control_home, tmp_path
+):
+    repo = tmp_path / "repo"
+    remote = tmp_path / "remote.git"
+    subprocess.run(
+        ["git", "init", "--bare", str(remote)],
+        check=True,
+        capture_output=True,
+    )
+    started = controller.start_project(
+        name="Git governed project",
+        goal="Implement one isolated change",
+        shell_key="code",
+        primary_path=str(repo),
+        repo_mode="init_local",
+        milestone="M1",
+    )
+    assert started["repository"]["status"] == "ready"
+    assert (repo / ".git").exists()
+    subprocess.run(
+        ["git", "-C", str(repo), "config", "user.email", "tests@example.invalid"],
+        check=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(repo), "config", "user.name", "Hermes Tests"],
+        check=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(repo), "remote", "add", "origin", str(remote)],
+        check=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(repo), "push", "-u", "origin", "main"],
+        check=True,
+        capture_output=True,
+    )
+
+    card = _approve_code_response(started)
+    with kb.connect_closing(board="default") as conn:
+        task = kb.get_task(conn, card["id"])
+    workspace = kb.resolve_workspace(task, board="default")
+    (workspace / "feature.txt").write_text("done\n", encoding="utf-8")
+    checkpoint = controller.checkpoint_card_git(card["id"], push=True)
+
+    assert checkpoint["pushed"] is True
+    assert checkpoint["branch"].startswith("git-governed-project/")
+    assert checkpoint["repository"]["last_commit_sha"] == checkpoint["sha"]
+    assert checkpoint["repository"]["last_pushed_sha"] == checkpoint["sha"]
+    remote_branches = subprocess.run(
+        ["git", "--git-dir", str(remote), "branch", "--list"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout
+    assert checkpoint["branch"] in remote_branches
+    summary = controller.inspect_project(started["project"]["id"])
+    assert summary["git_events"][0]["event_type"] == "card_branch_pushed"
 
 
 def test_legacy_schema_migrates_to_independent_threads_and_typed_links(

@@ -755,6 +755,11 @@ class ProjectStartBody(BaseModel):
     input_refs: list[str] = Field(default_factory=list)
     priority: int = 0
     executor_id: Optional[str] = None
+    milestone: Optional[str] = None
+    repo_mode: str = "none"
+    github_repo: Optional[str] = None
+    repo_visibility: str = "private"
+    default_branch: str = "main"
 
 
 class ProjectCardCreateBody(BaseModel):
@@ -767,6 +772,7 @@ class ProjectCardCreateBody(BaseModel):
     workspace_path: Optional[str] = None
     priority: int = 0
     executor_id: Optional[str] = None
+    milestone: Optional[str] = None
 
 
 class CardContinueBody(BaseModel):
@@ -779,6 +785,7 @@ class CardContinueBody(BaseModel):
     workspace_path: Optional[str] = None
     priority: int = 0
     executor_id: Optional[str] = None
+    milestone: Optional[str] = None
 
 
 class CardSplitBody(BaseModel):
@@ -793,6 +800,25 @@ class CardActionBody(BaseModel):
     workspace_kind: Optional[str] = None
     workspace_path: Optional[str] = None
     executor_id: Optional[str] = None
+    milestone: Optional[str] = None
+
+
+class ProjectApprovalDecisionBody(BaseModel):
+    decided_by: str = "dashboard-operator"
+    reason: Optional[str] = None
+
+
+class ProjectRepositoryBody(BaseModel):
+    mode: str
+    local_path: Optional[str] = None
+    github_repo: Optional[str] = None
+    visibility: str = "private"
+    default_branch: str = "main"
+
+
+class CardGitCheckpointBody(BaseModel):
+    message: Optional[str] = None
+    push: bool = False
 
 
 @router.get("/projects")
@@ -820,6 +846,11 @@ def start_managed_project(
             input_refs=payload.input_refs,
             priority=payload.priority,
             executor_id=payload.executor_id,
+            milestone=payload.milestone,
+            repo_mode=payload.repo_mode,
+            github_repo=payload.github_repo,
+            repo_visibility=payload.repo_visibility,
+            default_branch=payload.default_branch,
             created_by="dashboard-project-card-controller",
         )
     except (ValueError, project_card_controller.ProjectCardControllerError) as exc:
@@ -848,6 +879,7 @@ def add_managed_project_card(project_id: str, payload: ProjectCardCreateBody):
             workspace_path=payload.workspace_path,
             priority=payload.priority,
             executor_id=payload.executor_id,
+            milestone=payload.milestone,
             created_by="dashboard-project-card-controller",
         )
     except (ValueError, project_card_controller.ProjectCardControllerError) as exc:
@@ -862,12 +894,82 @@ def close_managed_project(project_id: str):
         raise HTTPException(status_code=409, detail=str(exc))
 
 
+@router.post("/projects/{project_id}/pause")
+def pause_managed_project(project_id: str):
+    try:
+        return project_card_controller.pause_project(project_id)
+    except (ValueError, project_card_controller.ProjectCardControllerError) as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+
+
 @router.post("/projects/{project_id}/reopen")
 def reopen_managed_project(project_id: str):
     try:
         return project_card_controller.reopen_project(project_id)
     except (ValueError, project_card_controller.ProjectCardControllerError) as exc:
         raise HTTPException(status_code=400, detail=str(exc))
+
+
+@router.get("/projects/{project_id}/approvals")
+def list_project_card_approvals(
+    project_id: str,
+    include_decided: bool = Query(False),
+):
+    try:
+        return project_card_controller.list_code_card_approvals(
+            project_id,
+            include_decided=include_decided,
+        )
+    except (ValueError, project_card_controller.ProjectCardControllerError) as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+
+
+@router.post("/projects/approvals/{approval_id}/approve")
+def approve_project_code_card(
+    approval_id: str,
+    payload: ProjectApprovalDecisionBody,
+):
+    try:
+        return project_card_controller.approve_code_card(
+            approval_id,
+            decided_by=payload.decided_by,
+            decision_reason=payload.reason,
+        )
+    except (ValueError, project_card_controller.ProjectCardControllerError) as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+
+
+@router.post("/projects/approvals/{approval_id}/reject")
+def reject_project_code_card(
+    approval_id: str,
+    payload: ProjectApprovalDecisionBody,
+):
+    try:
+        return project_card_controller.reject_code_card(
+            approval_id,
+            decided_by=payload.decided_by,
+            decision_reason=payload.reason,
+        )
+    except (ValueError, project_card_controller.ProjectCardControllerError) as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+
+
+@router.post("/projects/{project_id}/repository")
+def configure_project_repository(
+    project_id: str,
+    payload: ProjectRepositoryBody,
+):
+    try:
+        return project_card_controller.configure_repository(
+            project_id,
+            mode=payload.mode,
+            local_path=payload.local_path,
+            github_repo=payload.github_repo,
+            visibility=payload.visibility,
+            default_branch=payload.default_branch,
+        )
+    except (ValueError, project_card_controller.ProjectCardControllerError) as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
 
 
 @router.get("/cards/{card_id}/inspect")
@@ -895,6 +997,7 @@ def continue_managed_card(card_id: str, payload: CardContinueBody):
             workspace_path=payload.workspace_path,
             priority=payload.priority,
             executor_id=payload.executor_id,
+            milestone=payload.milestone,
             created_by="dashboard-project-card-controller",
         )
     except (ValueError, project_card_controller.ProjectCardControllerError) as exc:
@@ -939,10 +1042,23 @@ def recover_managed_card(card_id: str, payload: CardActionBody):
             workspace_kind=payload.workspace_kind,
             workspace_path=payload.workspace_path,
             executor_id=payload.executor_id,
+            milestone=payload.milestone,
             created_by="dashboard-project-card-controller",
         )
     except (ValueError, project_card_controller.ProjectCardControllerError) as exc:
         raise HTTPException(status_code=400, detail=str(exc))
+
+
+@router.post("/cards/{card_id}/git-checkpoint")
+def checkpoint_managed_card_git(card_id: str, payload: CardGitCheckpointBody):
+    try:
+        return project_card_controller.checkpoint_card_git(
+            card_id,
+            message=payload.message,
+            push=payload.push,
+        )
+    except (ValueError, project_card_controller.ProjectCardControllerError) as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
 
 
 # ---------------------------------------------------------------------------

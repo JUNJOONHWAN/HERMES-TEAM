@@ -8,6 +8,10 @@ or mutate the graph directly.
 
 from __future__ import annotations
 
+import hashlib
+import json
+import shutil
+import subprocess
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any, Iterable, Optional
@@ -17,7 +21,7 @@ from hermes_cli import projects_db as pdb
 from hermes_cli import supervisor_registry as registry
 
 
-SCHEMA = "hermes.project-card-controller.v1"
+SCHEMA = "hermes.project-card-controller.v2"
 ACTIVE_CARD_STATUSES = frozenset(
     {"triage", "todo", "scheduled", "ready", "running", "blocked", "review"}
 )
@@ -166,7 +170,7 @@ def _project(
         raise ProjectCardControllerError(f"unknown project: {value}")
     if not include_completed and project.status != "active":
         raise ProjectCardControllerError(
-            f"project {project.id} is {project.status}; reopen it before adding cards"
+            f"project {project.id} is {project.status}; resume or reopen it before adding cards"
         )
     return project
 
@@ -216,6 +220,7 @@ def _create_card(
     executor_id: Optional[str] = None,
     session_id: Optional[str] = None,
     created_by: str = "project-card-controller",
+    idempotency_key: Optional[str] = None,
 ) -> kb.Task:
     title = str(title or "").strip()
     if not title:
@@ -254,6 +259,7 @@ def _create_card(
         workspace_kind=kind,
         workspace_path=resolved_workspace_path,
         priority=int(priority or 0),
+        idempotency_key=idempotency_key,
         session_id=(str(session_id).strip() if session_id else None),
         adapter_executor_id=(str(executor_id).strip() if executor_id else None),
         adapter_override_mode="once",
@@ -272,6 +278,178 @@ def _create_card(
     return task
 
 
+def _approval_payload(
+    *,
+    action: str,
+    project: pdb.Project,
+    title: str,
+    shell_key: str,
+    body: Optional[str] = None,
+    source_task: Optional[kb.Task] = None,
+    relation_type: str = "depends_on",
+    acceptance_criteria: Optional[Iterable[Any]] = None,
+    input_refs: Optional[Iterable[Any]] = None,
+    workspace_kind: Optional[str] = None,
+    workspace_path: Optional[str] = None,
+    priority: int = 0,
+    executor_id: Optional[str] = None,
+    session_id: Optional[str] = None,
+    created_by: str = "project-card-controller",
+    milestone: Optional[str] = None,
+) -> dict[str, Any]:
+    return {
+        "action": str(action).strip(),
+        "project_id": project.id,
+        "board": _board_for_project(project),
+        "source_card_id": source_task.id if source_task else None,
+        "relation_type": str(relation_type or "depends_on").strip(),
+        "title": str(title or "").strip(),
+        "body": str(body).strip() if body and str(body).strip() else None,
+        "shell_key": str(shell_key or "").strip(),
+        "acceptance_criteria": _acceptance(acceptance_criteria, title),
+        "input_refs": _clean_list(input_refs),
+        "workspace_kind": str(workspace_kind).strip() if workspace_kind else None,
+        "workspace_path": str(workspace_path).strip() if workspace_path else None,
+        "priority": int(priority or 0),
+        "executor_id": str(executor_id).strip() if executor_id else None,
+        "session_id": str(session_id).strip() if session_id else None,
+        "created_by": str(created_by or "project-card-controller").strip(),
+        "milestone": str(milestone).strip() if milestone else None,
+    }
+
+
+def _request_code_card(payload: dict[str, Any]) -> dict:
+    encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+    dedupe = hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+    with pdb.connect_closing() as conn:
+        approval = pdb.create_card_approval(
+            conn,
+            project_id=payload["project_id"],
+            action=payload["action"],
+            source_card_id=payload.get("source_card_id"),
+            title=payload["title"],
+            shell_key=payload["shell_key"],
+            request=payload,
+            dedupe_key=dedupe,
+            requested_by=payload.get("created_by"),
+        )
+        # A proposal is a real control-plane stop, not just a UI label.  Once a
+        # code-card proposal exists every card-writing controller action is
+        # rejected until an operator approves/rejects and resumes the Project.
+        pdb.set_project_status(conn, payload["project_id"], "paused")
+        current = pdb.get_project_progress(conn, payload["project_id"]) or {}
+        pdb.upsert_project_progress(
+            conn,
+            payload["project_id"],
+            phase="awaiting_code_approval",
+            milestone=payload.get("milestone") or current.get("milestone"),
+            summary=f"Code card approval pending: {approval['id']}",
+            next_action=f"Approve or reject {approval['id']}",
+            last_card_id=current.get("last_card_id"),
+            last_verified_card_id=current.get("last_verified_card_id"),
+            counts=current.get("counts") or {},
+        )
+    return approval
+
+
+def _create_or_request_card(
+    *,
+    conn,
+    action: str,
+    project: pdb.Project,
+    title: str,
+    shell_key: str,
+    body: Optional[str] = None,
+    source_task: Optional[kb.Task] = None,
+    relation_type: str = "depends_on",
+    acceptance_criteria: Optional[Iterable[Any]] = None,
+    input_refs: Optional[Iterable[Any]] = None,
+    workspace_kind: Optional[str] = None,
+    workspace_path: Optional[str] = None,
+    priority: int = 0,
+    executor_id: Optional[str] = None,
+    session_id: Optional[str] = None,
+    created_by: str = "project-card-controller",
+    milestone: Optional[str] = None,
+) -> tuple[Optional[kb.Task], Optional[dict]]:
+    resolved_shell = _resolve_shell(conn, shell_key)
+    if project.status != "active" and not (
+        project.status == "paused" and resolved_shell.shell_key == "code"
+    ):
+        raise ProjectCardControllerError(
+            f"project {project.id} is {project.status}; resume or reopen it before adding cards"
+        )
+    if resolved_shell.shell_key == "code":
+        resolved_kind, resolved_path = _workspace_for_card(
+            project=project,
+            shell_key=resolved_shell.shell_key,
+            workspace_kind=workspace_kind,
+            workspace_path=workspace_path,
+        )
+        payload = _approval_payload(
+            action=action,
+            project=project,
+            title=title,
+            body=body,
+            shell_key=resolved_shell.shell_key,
+            source_task=source_task,
+            relation_type=relation_type,
+            acceptance_criteria=acceptance_criteria,
+            input_refs=input_refs,
+            workspace_kind=resolved_kind,
+            workspace_path=resolved_path,
+            priority=priority,
+            executor_id=executor_id,
+            session_id=session_id,
+            created_by=created_by,
+            milestone=milestone,
+        )
+        return None, _request_code_card(payload)
+    return (
+        _create_card(
+            conn=conn,
+            project=project,
+            title=title,
+            body=body,
+            shell_key=resolved_shell.shell_key,
+            source_task=source_task,
+            relation_type=relation_type,
+            acceptance_criteria=acceptance_criteria,
+            input_refs=input_refs,
+            workspace_kind=workspace_kind,
+            workspace_path=workspace_path,
+            priority=priority,
+            executor_id=executor_id,
+            session_id=session_id,
+            created_by=created_by,
+        ),
+        None,
+    )
+
+
+def _card_action_result(
+    *,
+    action: str,
+    project: pdb.Project,
+    board: str,
+    card: Optional[kb.Task],
+    approval: Optional[dict],
+    source_card_id: Optional[str] = None,
+) -> dict[str, Any]:
+    result: dict[str, Any] = {
+        "schema": SCHEMA,
+        "action": action,
+        "project_id": project.id,
+        "board": board,
+        "approval_required": approval is not None,
+        "card": asdict(card) if card is not None else None,
+        "approval_request": approval,
+    }
+    if source_card_id:
+        result["source_card_id"] = source_card_id
+    return result
+
+
 def start_project(
     *,
     name: str,
@@ -287,8 +465,13 @@ def start_project(
     executor_id: Optional[str] = None,
     session_id: Optional[str] = None,
     created_by: str = "project-card-controller",
+    milestone: Optional[str] = None,
+    repo_mode: str = "none",
+    github_repo: Optional[str] = None,
+    repo_visibility: str = "private",
+    default_branch: str = "main",
 ) -> dict[str, Any]:
-    """Create an active project and its first root card."""
+    """Create an active project and either its first card or code approval."""
     name = str(name or "").strip()
     goal = str(goal or "").strip()
     if not name or not goal:
@@ -321,11 +504,22 @@ def start_project(
         )
         project = pdb.get_project(project_conn, project_id)
     assert project is not None
+    repository_result = configure_repository(
+        project.id,
+        mode=repo_mode,
+        local_path=primary_path,
+        github_repo=github_repo,
+        visibility=repo_visibility,
+        default_branch=default_branch,
+    )
+    # Repository setup can promote a supplied folder to the primary path.
+    project = _project(project.id, include_completed=False)
     try:
         with kb.connect_closing(board=board_slug) as conn:
             registry.ensure_schema(conn)
-            card = _create_card(
+            card, approval = _create_or_request_card(
                 conn=conn,
+                action="start_project",
                 project=project,
                 title=goal,
                 body=description,
@@ -336,20 +530,35 @@ def start_project(
                 executor_id=executor_id,
                 session_id=session_id,
                 created_by=created_by,
+                milestone=milestone,
             )
     except Exception:
-        # Compensate only the metadata row created by this call. No existing
-        # board or operator state is deleted.
+        # Repository provisioning may already have created durable local or
+        # remote state. Keep the Project row as the recovery anchor instead of
+        # deleting metadata and orphaning that state.
         with pdb.connect_closing() as project_conn:
-            pdb.delete_project(project_conn, project_id)
+            pdb.upsert_project_progress(
+                project_conn,
+                project_id,
+                phase="blocked",
+                milestone=milestone,
+                summary="First card creation failed after project creation",
+                next_action="Repair repository/card configuration and retry",
+            )
         raise
-    return {
-        "schema": SCHEMA,
-        "action": "start_project",
-        "project": project.to_dict(),
-        "card": asdict(card),
-        "board": board_slug,
-    }
+    result = _card_action_result(
+        action="start_project",
+        project=project,
+        board=board_slug,
+        card=card,
+        approval=approval,
+    )
+    # Code proposals pause the Project inside the Project DB. Return that
+    # durable state instead of the stale pre-proposal dataclass.
+    project = _project(project.id, include_completed=True)
+    result["project"] = project.to_dict()
+    result["repository"] = repository_result.get("repository")
+    return result
 
 
 def continue_card(
@@ -366,6 +575,7 @@ def continue_card(
     executor_id: Optional[str] = None,
     session_id: Optional[str] = None,
     created_by: str = "project-card-controller",
+    milestone: Optional[str] = None,
 ) -> dict[str, Any]:
     located = locate_card(card_id)
     board = located["board"]
@@ -374,12 +584,13 @@ def continue_card(
         raise ProjectCardControllerError(
             f"card {source.id} is not attached to a Project"
         )
-    project = _project(source.project_id, include_completed=False)
+    project = _project(source.project_id, include_completed=True)
     with kb.connect_closing(board=board) as conn:
         registry.ensure_schema(conn)
         key = shell_key or _source_shell_key(conn, source)
-        card = _create_card(
+        card, approval = _create_or_request_card(
             conn=conn,
+            action="continue_card",
             project=project,
             source_task=source,
             relation_type="follows",
@@ -394,15 +605,16 @@ def continue_card(
             executor_id=executor_id,
             session_id=session_id,
             created_by=created_by,
+            milestone=milestone,
         )
-    return {
-        "schema": SCHEMA,
-        "action": "continue_card",
-        "project_id": project.id,
-        "board": board,
-        "source_card_id": source.id,
-        "card": asdict(card),
-    }
+    return _card_action_result(
+        action="continue_card",
+        project=project,
+        board=board,
+        card=card,
+        approval=approval,
+        source_card_id=source.id,
+    )
 
 
 def add_project_card(
@@ -419,14 +631,16 @@ def add_project_card(
     executor_id: Optional[str] = None,
     session_id: Optional[str] = None,
     created_by: str = "project-card-controller",
+    milestone: Optional[str] = None,
 ) -> dict[str, Any]:
     """Create an independent root-card thread inside an active Project."""
-    project = _project(project_id, include_completed=False)
+    project = _project(project_id, include_completed=True)
     board = _board_for_project(project)
     with kb.connect_closing(board=board) as conn:
         registry.ensure_schema(conn)
-        card = _create_card(
+        card, approval = _create_or_request_card(
             conn=conn,
+            action="add_project_card",
             project=project,
             title=title,
             body=body,
@@ -439,14 +653,15 @@ def add_project_card(
             executor_id=executor_id,
             session_id=session_id,
             created_by=created_by,
+            milestone=milestone,
         )
-    return {
-        "schema": SCHEMA,
-        "action": "add_project_card",
-        "project_id": project.id,
-        "board": board,
-        "card": asdict(card),
-    }
+    return _card_action_result(
+        action="add_project_card",
+        project=project,
+        board=board,
+        card=card,
+        approval=approval,
+    )
 
 
 def split_card(
@@ -468,8 +683,9 @@ def split_card(
         raise ProjectCardControllerError(
             f"card {source.id} is not attached to a Project"
         )
-    project = _project(source.project_id, include_completed=False)
+    project = _project(source.project_id, include_completed=True)
     created: list[kb.Task] = []
+    approvals: list[dict] = []
     with kb.connect_closing(board=board) as conn:
         registry.ensure_schema(conn)
         default_shell = _source_shell_key(conn, source)
@@ -484,42 +700,58 @@ def split_card(
             if not title:
                 raise ProjectCardControllerError("each split card needs a title")
             shell_key = str(item.get("shell_key") or default_shell)
-            _resolve_shell(conn, shell_key)
+            resolved_shell = _resolve_shell(conn, shell_key)
             workspace_kind = item.get("workspace_kind")
             if workspace_kind and workspace_kind not in kb.VALID_WORKSPACE_KINDS:
                 raise ProjectCardControllerError(
                     f"workspace_kind must be one of {sorted(kb.VALID_WORKSPACE_KINDS)}"
                 )
-            normalized.append(dict(item, title=title, shell_key=shell_key))
+            normalized.append(
+                dict(item, title=title, shell_key=resolved_shell.shell_key)
+            )
         try:
             for item in normalized:
-                created.append(
-                    _create_card(
-                        conn=conn,
-                        project=project,
-                        source_task=source,
-                        # Split children are parallel parts, not work that waits
-                        # for the container card to become done.
-                        relation_type="references",
-                        title=item["title"],
-                        body=item.get("body"),
-                        shell_key=item["shell_key"],
-                        acceptance_criteria=item.get("acceptance_criteria"),
-                        input_refs=item.get("input_refs"),
-                        workspace_kind=item.get("workspace_kind"),
-                        workspace_path=item.get("workspace_path"),
-                        priority=int(item.get("priority") or 0),
-                        executor_id=item.get("executor_id"),
-                        session_id=session_id,
-                        created_by=created_by,
-                    )
+                card, approval = _create_or_request_card(
+                    conn=conn,
+                    action="split_card",
+                    project=project,
+                    source_task=source,
+                    # Split children are parallel parts, not work that waits
+                    # for the container card to become done.
+                    relation_type="references",
+                    title=item["title"],
+                    body=item.get("body"),
+                    shell_key=item["shell_key"],
+                    acceptance_criteria=item.get("acceptance_criteria"),
+                    input_refs=item.get("input_refs"),
+                    workspace_kind=item.get("workspace_kind"),
+                    workspace_path=item.get("workspace_path"),
+                    priority=int(item.get("priority") or 0),
+                    executor_id=item.get("executor_id"),
+                    session_id=session_id,
+                    created_by=created_by,
+                    milestone=item.get("milestone"),
                 )
+                if card is not None:
+                    created.append(card)
+                if approval is not None:
+                    approvals.append(approval)
         except Exception:
             for task in reversed(created):
                 try:
                     kb.delete_task(conn, task.id)
                 except Exception:
                     pass
+            if approvals:
+                with pdb.connect_closing() as project_conn:
+                    for approval in approvals:
+                        pdb.update_card_approval(
+                            project_conn,
+                            approval["id"],
+                            status="rejected",
+                            decided_by=created_by,
+                            decision_reason="split creation rolled back",
+                        )
             raise
     return {
         "schema": SCHEMA,
@@ -528,6 +760,8 @@ def split_card(
         "board": board,
         "source_card_id": source.id,
         "cards": [asdict(card) for card in created],
+        "approval_required": bool(approvals),
+        "approval_requests": approvals,
     }
 
 
@@ -585,6 +819,7 @@ def recover_card(
     executor_id: Optional[str] = None,
     session_id: Optional[str] = None,
     created_by: str = "project-card-controller",
+    milestone: Optional[str] = None,
 ) -> dict[str, Any]:
     located = locate_card(card_id)
     board = located["board"]
@@ -601,13 +836,14 @@ def recover_card(
         raise ProjectCardControllerError(
             f"card {source.id} is done; use continue_card or verify_card"
         )
-    project = _project(source.project_id, include_completed=False)
+    project = _project(source.project_id, include_completed=True)
     recovery_title = str(title or f"Recover {source.id}: {source.title}").strip()
     with kb.connect_closing(board=board) as conn:
         registry.ensure_schema(conn)
         key = shell_key or _source_shell_key(conn, source)
-        card = _create_card(
+        card, approval = _create_or_request_card(
             conn=conn,
+            action="recover_card",
             project=project,
             source_task=source,
             relation_type="recovers",
@@ -620,21 +856,626 @@ def recover_card(
             executor_id=executor_id,
             session_id=session_id,
             created_by=created_by,
+            milestone=milestone,
         )
-        recovery_sources = registry.register_task_recovery_sources(
+        recovery_sources = []
+        if card is not None:
+            recovery_sources = registry.register_task_recovery_sources(
+                conn,
+                recovery_task_id=card.id,
+                source_task_ids=[source.id],
+                created_by=created_by,
+            )
+    result = _card_action_result(
+        action="recover_card",
+        project=project,
+        board=board,
+        card=card,
+        approval=approval,
+        source_card_id=source.id,
+    )
+    result["recovery_sources"] = recovery_sources
+    return result
+
+
+def approve_code_card(
+    approval_id: str,
+    *,
+    decided_by: str = "operator",
+    decision_reason: Optional[str] = None,
+) -> dict[str, Any]:
+    """Consume one operator-approved proposal and create the code card once."""
+    approval_key = str(approval_id or "").strip()
+    if not approval_key:
+        raise ProjectCardControllerError("approval_id is required")
+    with pdb.connect_closing() as project_conn:
+        approval = pdb.get_card_approval(project_conn, approval_key)
+        if approval is None:
+            raise ProjectCardControllerError(
+                f"unknown project card approval: {approval_key}"
+            )
+        if approval["status"] == "rejected":
+            raise ProjectCardControllerError(
+                f"approval {approval_key} was rejected"
+            )
+        if approval["status"] == "consumed" and approval.get("created_task_id"):
+            located = locate_card(str(approval["created_task_id"]))
+            return {
+                "schema": SCHEMA,
+                "action": "approve_code_card",
+                "project_id": approval["project_id"],
+                "board": located["board"],
+                "approval_required": False,
+                "approval_request": approval,
+                "card": asdict(located["task"]),
+                "idempotent_replay": True,
+            }
+        project_row = pdb.get_project(project_conn, str(approval["project_id"]))
+        if project_row is None:
+            raise ProjectCardControllerError(
+                f"unknown project: {approval['project_id']}"
+            )
+        if project_row.status == "completed":
+            raise ProjectCardControllerError(
+                f"project {project_row.id} is completed; reopen it before approving cards"
+            )
+        approval = pdb.update_card_approval(
+            project_conn,
+            approval_key,
+            status="approved",
+            decided_by=decided_by,
+            decision_reason=decision_reason,
+        )
+    assert approval is not None
+    payload = approval.get("request") or {}
+    project = _project(str(approval["project_id"]), include_completed=True)
+    with pdb.connect_closing() as project_conn:
+        pdb.set_project_status(project_conn, project.id, "active")
+    project = _project(project.id, include_completed=False)
+    board = str(payload.get("board") or _board_for_project(project))
+    source = None
+    source_id = str(payload.get("source_card_id") or "").strip()
+    try:
+        with kb.connect_closing(board=board) as conn:
+            registry.ensure_schema(conn)
+            if source_id:
+                source = kb.get_task(conn, source_id)
+                if source is None:
+                    raise ProjectCardControllerError(
+                        f"approval source card not found: {source_id}"
+                    )
+                if source.project_id != project.id:
+                    raise ProjectCardControllerError(
+                        f"approval source card belongs to another project: {source_id}"
+                    )
+            card = _create_card(
+                conn=conn,
+                project=project,
+                source_task=source,
+                relation_type=str(payload.get("relation_type") or "depends_on"),
+                title=str(payload.get("title") or approval["title"]),
+                body=payload.get("body"),
+                shell_key="code",
+                acceptance_criteria=payload.get("acceptance_criteria"),
+                input_refs=payload.get("input_refs"),
+                workspace_kind=payload.get("workspace_kind"),
+                workspace_path=payload.get("workspace_path"),
+                priority=int(payload.get("priority") or 0),
+                executor_id=payload.get("executor_id"),
+                session_id=payload.get("session_id"),
+                created_by=str(payload.get("created_by") or decided_by),
+                idempotency_key=f"project-approval:{approval_key}",
+            )
+            if payload.get("action") == "recover_card" and source is not None:
+                registry.register_task_recovery_sources(
+                    conn,
+                    recovery_task_id=card.id,
+                    source_task_ids=[source.id],
+                    created_by=str(payload.get("created_by") or decided_by),
+                )
+    except Exception:
+        # Approval without card creation is not permission to continue. Restore
+        # the hard stop so a transient Git/workspace failure cannot reopen the
+        # project behind the operator's back.
+        with pdb.connect_closing() as project_conn:
+            pdb.set_project_status(project_conn, project.id, "paused")
+            pdb.update_card_approval(
+                project_conn,
+                approval_key,
+                status="pending",
+                decided_by=decided_by,
+                decision_reason="card creation failed; approval reset to pending",
+            )
+        raise
+    with pdb.connect_closing() as project_conn:
+        consumed = pdb.update_card_approval(
+            project_conn,
+            approval_key,
+            status="consumed",
+            decided_by=decided_by,
+            decision_reason=decision_reason,
+            created_task_id=card.id,
+        )
+    sync_project_progress(project.id, milestone=payload.get("milestone"))
+    return {
+        "schema": SCHEMA,
+        "action": "approve_code_card",
+        "project_id": project.id,
+        "board": board,
+        "approval_required": False,
+        "approval_request": consumed,
+        "card": asdict(card),
+        "idempotent_replay": False,
+    }
+
+
+def reject_code_card(
+    approval_id: str,
+    *,
+    decided_by: str = "operator",
+    decision_reason: Optional[str] = None,
+) -> dict[str, Any]:
+    approval_key = str(approval_id or "").strip()
+    with pdb.connect_closing() as conn:
+        approval = pdb.get_card_approval(conn, approval_key)
+        if approval is None:
+            raise ProjectCardControllerError(
+                f"unknown project card approval: {approval_key}"
+            )
+        if approval["status"] == "consumed":
+            raise ProjectCardControllerError(
+                f"approval {approval_key} already created card "
+                f"{approval.get('created_task_id')}"
+            )
+        rejected = pdb.update_card_approval(
             conn,
-            recovery_task_id=card.id,
-            source_task_ids=[source.id],
-            created_by=created_by,
+            approval_key,
+            status="rejected",
+            decided_by=decided_by,
+            decision_reason=decision_reason,
+        )
+        remaining = pdb.list_card_approvals(
+            conn,
+            str(approval["project_id"]),
+            statuses=("pending", "approved"),
+        )
+        if not remaining:
+            project = pdb.get_project(conn, str(approval["project_id"]))
+            if project is not None and project.status == "paused":
+                pdb.set_project_status(conn, project.id, "active")
+    sync_project_progress(str(approval["project_id"]))
+    return {
+        "schema": SCHEMA,
+        "action": "reject_code_card",
+        "project_id": approval["project_id"],
+        "approval_required": False,
+        "approval_request": rejected,
+        "card": None,
+    }
+
+
+def list_code_card_approvals(
+    project_id: str,
+    *,
+    include_decided: bool = False,
+) -> dict[str, Any]:
+    project = _project(project_id, include_completed=True)
+    statuses = None if include_decided else ("pending", "approved")
+    with pdb.connect_closing() as conn:
+        approvals = pdb.list_card_approvals(
+            conn,
+            project.id,
+            statuses=statuses,
         )
     return {
         "schema": SCHEMA,
-        "action": "recover_card",
+        "action": "list_code_card_approvals",
+        "project_id": project.id,
+        "approval_requests": approvals,
+    }
+
+
+def sync_project_progress(
+    project_id: str,
+    *,
+    milestone: Optional[str] = None,
+) -> dict:
+    """Persist the Kanban projection in the separate per-profile Project DB."""
+    project = _project(project_id, include_completed=True, include_archived=True)
+    board = _board_for_project(project)
+    with kb.connect_closing(board=board) as conn:
+        rows = conn.execute(
+            "SELECT id, status, role_shell_id, created_at FROM tasks "
+            "WHERE project_id = ? ORDER BY created_at, rowid",
+            (project.id,),
+        ).fetchall()
+        counts: dict[str, int] = {}
+        last_card_id = None
+        last_verified_card_id = None
+        for row in rows:
+            status = str(row["status"])
+            counts[status] = counts.get(status, 0) + 1
+            last_card_id = str(row["id"])
+            if row["role_shell_id"]:
+                shell = registry.get_shell(conn, shell_id=row["role_shell_id"])
+                if shell and shell.shell_key == "verification" and status == "done":
+                    last_verified_card_id = str(row["id"])
+    with pdb.connect_closing() as project_conn:
+        pending = pdb.list_card_approvals(
+            project_conn,
+            project.id,
+            statuses=("pending", "approved"),
+        )
+        previous = pdb.get_project_progress(project_conn, project.id) or {}
+        if project.status == "completed":
+            phase = "completed"
+            next_action = None
+        elif project.status == "paused" and pending:
+            phase = "awaiting_code_approval"
+            next_action = f"Approve or reject {pending[0]['id']}"
+        elif project.status == "paused":
+            phase = "paused"
+            next_action = "Resume the project when the operator is ready"
+        elif pending:
+            phase = "awaiting_code_approval"
+            next_action = f"Approve or reject {pending[0]['id']}"
+        elif counts.get("blocked", 0):
+            phase = "blocked"
+            next_action = "Resolve or recover blocked cards"
+        elif counts.get("running", 0):
+            phase = "active"
+            next_action = "Wait for running cards or inspect progress"
+        elif any(counts.get(status, 0) for status in ACTIVE_CARD_STATUSES):
+            phase = "active"
+            next_action = "Dispatch or complete open cards"
+        elif rows:
+            phase = "awaiting_next_step"
+            next_action = "Propose the next milestone or close the project"
+        else:
+            phase = "planning"
+            next_action = "Create the first project card"
+        progress = pdb.upsert_project_progress(
+            project_conn,
+            project.id,
+            phase=phase,
+            milestone=milestone or previous.get("milestone"),
+            summary=(
+                f"{len(rows)} cards; {len(pending)} code approvals pending"
+            ),
+            next_action=next_action,
+            last_card_id=last_card_id,
+            last_verified_card_id=last_verified_card_id,
+            counts=counts,
+        )
+    progress["pending_approval_count"] = len(pending)
+    return progress
+
+
+_REPO_MODE_VALUES = frozenset({"none", "existing", "init_local", "github"})
+_REPO_VISIBILITY_VALUES = frozenset({"private", "public"})
+
+
+def _run_process(
+    argv: list[str],
+    *,
+    cwd: Path,
+    allow_failure: bool = False,
+) -> subprocess.CompletedProcess[str]:
+    try:
+        result = subprocess.run(
+            argv,
+            cwd=str(cwd),
+            text=True,
+            capture_output=True,
+            timeout=120,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        if allow_failure:
+            return subprocess.CompletedProcess(argv, 1, "", str(exc))
+        raise ProjectCardControllerError(f"command failed: {argv[0]}: {exc}") from exc
+    if result.returncode != 0 and not allow_failure:
+        detail = (result.stderr or result.stdout or "unknown error").strip()
+        raise ProjectCardControllerError(
+            f"command failed ({' '.join(argv[:3])}): {detail}"
+        )
+    return result
+
+
+def _git_text(path: Path, *args: str, allow_failure: bool = False) -> str:
+    result = _run_process(
+        ["git", "-C", str(path), *args],
+        cwd=path,
+        allow_failure=allow_failure,
+    )
+    return str(result.stdout or "").strip() if result.returncode == 0 else ""
+
+
+def _repository_snapshot(path: Path) -> dict[str, Optional[str]]:
+    return {
+        "current_branch": _git_text(path, "branch", "--show-current", allow_failure=True) or None,
+        "head_sha": _git_text(path, "rev-parse", "HEAD", allow_failure=True) or None,
+        "remote_url": _git_text(
+            path, "remote", "get-url", "origin", allow_failure=True
+        ) or None,
+    }
+
+
+def configure_repository(
+    project_id: str,
+    *,
+    mode: str,
+    local_path: Optional[str] = None,
+    github_repo: Optional[str] = None,
+    visibility: str = "private",
+    default_branch: str = "main",
+) -> dict[str, Any]:
+    """Connect, initialise, or create the Project's governed repository."""
+    project = _project(project_id, include_completed=False)
+    normalized_mode = str(mode or "none").strip().lower()
+    if normalized_mode not in _REPO_MODE_VALUES:
+        raise ProjectCardControllerError(
+            f"repository mode must be one of {sorted(_REPO_MODE_VALUES)}"
+        )
+    branch = str(default_branch or "main").strip()
+    if not branch or any(ch.isspace() for ch in branch) or branch.startswith("-"):
+        raise ProjectCardControllerError("invalid default branch")
+    normalized_visibility = str(visibility or "private").strip().lower()
+    if normalized_visibility not in _REPO_VISIBILITY_VALUES:
+        raise ProjectCardControllerError("visibility must be private or public")
+    if normalized_mode == "none":
+        with pdb.connect_closing() as conn:
+            repository = pdb.upsert_project_repository(
+                conn,
+                project.id,
+                mode="none",
+                status="disabled",
+                local_path=project.primary_path,
+                visibility=None,
+                last_error=None,
+            )
+        return {
+            "schema": SCHEMA,
+            "action": "configure_repository",
+            "project_id": project.id,
+            "repository": repository,
+        }
+
+    path_text = str(local_path or project.primary_path or "").strip()
+    if not path_text:
+        raise ProjectCardControllerError(
+            "repository setup requires local_path or Project primary_path"
+        )
+    path = Path(path_text).expanduser()
+    if not path.is_absolute():
+        raise ProjectCardControllerError("repository local_path must be absolute")
+    path.mkdir(parents=True, exist_ok=True)
+    path = path.resolve(strict=False)
+    if shutil.which("git") is None:
+        raise ProjectCardControllerError("git executable is not installed")
+
+    with pdb.connect_closing() as conn:
+        if project.primary_path != str(path):
+            pdb.add_folder(conn, project.id, str(path), is_primary=True)
+        pdb.upsert_project_repository(
+            conn,
+            project.id,
+            mode=normalized_mode,
+            provider="github" if normalized_mode == "github" else "git",
+            local_path=str(path),
+            remote_name=str(github_repo).strip() if github_repo else None,
+            visibility=(normalized_visibility if normalized_mode == "github" else None),
+            default_branch=branch,
+            integration_branch=f"integration/{project.slug}",
+            status="provisioning",
+            last_error=None,
+        )
+    try:
+        repo_root = kb._repo_root_for_worktree_target(path)
+        if normalized_mode == "existing" and repo_root is None:
+            raise ProjectCardControllerError(
+                f"existing repository path is not inside Git: {path}"
+            )
+        if repo_root is None:
+            _run_process(["git", "init", "-b", branch, str(path)], cwd=path)
+            repo_root = path
+        else:
+            path = repo_root
+
+        if not _git_text(path, "rev-parse", "HEAD", allow_failure=True):
+            _run_process(
+                [
+                    "git", "-C", str(path),
+                    "-c", "user.name=Hermes Project Controller",
+                    "-c", "user.email=hermes@localhost",
+                    "commit", "--allow-empty", "-m",
+                    "chore: initialize project repository",
+                ],
+                cwd=path,
+            )
+
+        if normalized_mode == "github":
+            if shutil.which("gh") is None:
+                raise ProjectCardControllerError("GitHub CLI (gh) is not installed")
+            repo_name = str(github_repo or project.slug).strip()
+            if (
+                not repo_name
+                or repo_name.startswith("-")
+                or repo_name.count("/") > 1
+                or any(
+                    not part
+                    or not all(ch.isalnum() or ch in "._-" for ch in part)
+                    for part in repo_name.split("/")
+                )
+            ):
+                raise ProjectCardControllerError("invalid GitHub repository name")
+            origin = _git_text(
+                path, "remote", "get-url", "origin", allow_failure=True
+            )
+            if not origin:
+                _run_process(
+                    [
+                        "gh", "repo", "create", repo_name, "--source", str(path),
+                        "--remote", "origin", f"--{normalized_visibility}",
+                    ],
+                    cwd=path,
+                )
+            _run_process(
+                ["git", "-C", str(path), "push", "-u", "origin", branch],
+                cwd=path,
+            )
+
+        snapshot = _repository_snapshot(path)
+        with pdb.connect_closing() as conn:
+            repository = pdb.upsert_project_repository(
+                conn,
+                project.id,
+                mode=normalized_mode,
+                provider="github" if normalized_mode == "github" else "git",
+                local_path=str(path),
+                remote_name=(str(github_repo or project.slug) if normalized_mode == "github" else None),
+                remote_url=snapshot["remote_url"],
+                visibility=(normalized_visibility if normalized_mode == "github" else None),
+                default_branch=branch,
+                integration_branch=f"integration/{project.slug}",
+                status="ready",
+                last_error=None,
+                current_branch=snapshot["current_branch"],
+                base_sha=snapshot["head_sha"],
+                head_sha=snapshot["head_sha"],
+                last_pushed_sha=(snapshot["head_sha"] if normalized_mode == "github" else None),
+            )
+            event = pdb.record_git_event(
+                conn,
+                project_id=project.id,
+                event_type="repository_configured",
+                branch=snapshot["current_branch"],
+                sha=snapshot["head_sha"],
+                remote=snapshot["remote_url"],
+                status="succeeded",
+                detail=f"mode={normalized_mode}",
+            )
+    except Exception as exc:
+        with pdb.connect_closing() as conn:
+            pdb.upsert_project_repository(
+                conn,
+                project.id,
+                mode=normalized_mode,
+                local_path=str(path),
+                status="error",
+                last_error=str(exc),
+            )
+            pdb.record_git_event(
+                conn,
+                project_id=project.id,
+                event_type="repository_configured",
+                status="failed",
+                detail=str(exc),
+            )
+        raise
+    return {
+        "schema": SCHEMA,
+        "action": "configure_repository",
+        "project_id": project.id,
+        "repository": repository,
+        "git_event": event,
+    }
+
+
+def checkpoint_card_git(
+    card_id: str,
+    *,
+    message: Optional[str] = None,
+    push: bool = False,
+) -> dict[str, Any]:
+    """Commit a card worktree and optionally push only its non-main branch."""
+    located = locate_card(card_id)
+    board = located["board"]
+    task: kb.Task = located["task"]
+    if not task.project_id:
+        raise ProjectCardControllerError(f"card {task.id} is not in a Project")
+    project = _project(task.project_id, include_completed=True)
+    workspace = kb.resolve_workspace(task, board=board)
+    repo_root = kb._repo_root_for_worktree_target(workspace)
+    if repo_root is None:
+        raise ProjectCardControllerError(
+            f"card workspace is not inside a Git repository: {workspace}"
+        )
+    changed = _git_text(workspace, "status", "--porcelain", allow_failure=True)
+    protected = []
+    for line in changed.splitlines():
+        candidate = line[3:].strip().lower() if len(line) > 3 else ""
+        if candidate == ".env" or candidate.endswith("/.env") or "credential" in candidate:
+            protected.append(candidate)
+    if protected:
+        raise ProjectCardControllerError(
+            "refusing to auto-stage protected files: " + ", ".join(protected)
+        )
+    if changed:
+        _run_process(["git", "-C", str(workspace), "add", "-A"], cwd=workspace)
+        commit_message = str(message or f"{project.slug}: {task.id} {task.title}").strip()
+        _run_process(
+            ["git", "-C", str(workspace), "commit", "-m", commit_message],
+            cwd=workspace,
+        )
+    branch = _git_text(workspace, "branch", "--show-current")
+    sha = _git_text(workspace, "rev-parse", "HEAD")
+    remote = _git_text(
+        workspace, "remote", "get-url", "origin", allow_failure=True
+    ) or None
+    pushed = False
+    if push:
+        with pdb.connect_closing() as conn:
+            repository = pdb.get_project_repository(conn, project.id) or {}
+        protected_branches = {
+            str(repository.get("default_branch") or "main"), "main", "master"
+        }
+        if branch in protected_branches:
+            raise ProjectCardControllerError(
+                "direct project default-branch push is forbidden; use a card branch"
+            )
+        if not remote:
+            raise ProjectCardControllerError("card repository has no origin remote")
+        _run_process(
+            ["git", "-C", str(workspace), "push", "-u", "origin", branch],
+            cwd=workspace,
+        )
+        pushed = True
+    with pdb.connect_closing() as conn:
+        repository = pdb.upsert_project_repository(
+            conn,
+            project.id,
+            local_path=str(repo_root),
+            status="ready",
+            current_branch=branch,
+            head_sha=sha,
+            last_card_id=task.id,
+            last_commit_sha=sha,
+            last_pushed_sha=sha if pushed else None,
+        )
+        event = pdb.record_git_event(
+            conn,
+            project_id=project.id,
+            card_id=task.id,
+            event_type="card_branch_pushed" if pushed else "card_committed",
+            branch=branch,
+            sha=sha,
+            remote=remote,
+            status="succeeded",
+            detail="clean checkpoint" if not changed else "changes committed",
+        )
+    return {
+        "schema": SCHEMA,
+        "action": "checkpoint_card_git",
         "project_id": project.id,
         "board": board,
-        "source_card_id": source.id,
-        "recovery_sources": recovery_sources,
-        "card": asdict(card),
+        "card_id": task.id,
+        "workspace": str(workspace),
+        "branch": branch,
+        "sha": sha,
+        "pushed": pushed,
+        "repository": repository,
+        "git_event": event,
     }
 
 
@@ -688,12 +1529,25 @@ def inspect_project(
     roots: dict[str, list[str]] = {}
     for card in cards:
         roots.setdefault(card.root_task_id or card.id, []).append(card.id)
+    progress = sync_project_progress(project.id)
+    with pdb.connect_closing() as project_conn:
+        approvals = pdb.list_card_approvals(
+            project_conn,
+            project.id,
+            statuses=("pending", "approved"),
+        )
+        repository = pdb.get_project_repository(project_conn, project.id)
+        git_events = pdb.list_git_events(project_conn, project.id, limit=20)
     return {
         "schema": SCHEMA,
         "action": "inspect_project",
         "project": project.to_dict(),
         "board": board,
         "counts": counts,
+        "progress": progress,
+        "approval_requests": approvals,
+        "repository": repository,
+        "git_events": git_events,
         "threads": [
             {"root_card_id": root_id, "card_ids": ids}
             for root_id, ids in roots.items()
@@ -716,6 +1570,10 @@ def list_projects(*, include_archived: bool = False) -> dict[str, Any]:
         item["counts"] = summary["counts"]
         item["thread_count"] = len(summary["threads"])
         item["card_count"] = len(summary["cards"])
+        item["progress"] = summary["progress"]
+        item["pending_approval_count"] = len(summary["approval_requests"])
+        item["approval_requests"] = summary["approval_requests"]
+        item["repository"] = summary["repository"]
         rows.append(item)
     return {"schema": SCHEMA, "action": "list_projects", "projects": rows}
 
@@ -735,14 +1593,27 @@ def close_project(project_id: str) -> dict[str, Any]:
             + ", ".join(f"{row['id']}({row['status']})" for row in rows[:20])
         )
     with pdb.connect_closing() as conn:
+        pending = pdb.list_card_approvals(
+            conn,
+            project.id,
+            statuses=("pending", "approved"),
+        )
+    if pending:
+        raise ProjectCardControllerError(
+            "project has pending code-card approvals: "
+            + ", ".join(item["id"] for item in pending[:20])
+        )
+    with pdb.connect_closing() as conn:
         if not pdb.set_project_status(conn, project.id, "completed"):
             raise ProjectCardControllerError(f"project not found: {project.id}")
         closed = pdb.get_project(conn, project.id)
+    progress = sync_project_progress(project.id)
     return {
         "schema": SCHEMA,
         "action": "close_project",
         "project": closed.to_dict() if closed else None,
         "board": board,
+        "progress": progress,
     }
 
 
@@ -752,9 +1623,44 @@ def reopen_project(project_id: str) -> dict[str, Any]:
         if not pdb.set_project_status(conn, project.id, "active"):
             raise ProjectCardControllerError(f"project not found: {project.id}")
         reopened = pdb.get_project(conn, project.id)
+    progress = sync_project_progress(project.id)
     return {
         "schema": SCHEMA,
         "action": "reopen_project",
         "project": reopened.to_dict() if reopened else None,
         "board": _board_for_project(project),
+        "progress": progress,
+    }
+
+
+def pause_project(project_id: str) -> dict[str, Any]:
+    """Apply a durable operator stop without pretending the Project is done."""
+    project = _project(project_id)
+    if project.status == "completed":
+        raise ProjectCardControllerError(
+            f"project {project.id} is completed; reopen it before pausing"
+        )
+    board = _board_for_project(project)
+    with kb.connect_closing(board=board) as conn:
+        running = conn.execute(
+            "SELECT id FROM tasks WHERE project_id = ? AND status = 'running' "
+            "ORDER BY created_at, id",
+            (project.id,),
+        ).fetchall()
+    if running:
+        raise ProjectCardControllerError(
+            "project has running cards; archive or reclaim them before pausing: "
+            + ", ".join(str(row["id"]) for row in running[:20])
+        )
+    with pdb.connect_closing() as conn:
+        pdb.set_project_status(conn, project.id, "paused")
+        pdb.set_active(conn, None)
+        paused = pdb.get_project(conn, project.id)
+    progress = sync_project_progress(project.id)
+    return {
+        "schema": SCHEMA,
+        "action": "pause_project",
+        "project": paused.to_dict() if paused else None,
+        "board": board,
+        "progress": progress,
     }

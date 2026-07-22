@@ -24,6 +24,7 @@ The schema is intentionally small and additive: column additions go through
 from __future__ import annotations
 
 import contextlib
+import json
 import os
 import re
 import secrets
@@ -96,6 +97,88 @@ CREATE TABLE IF NOT EXISTS discovered_repos (
     label         TEXT,
     last_seen     INTEGER NOT NULL
 );
+
+-- Durable controller projection. Kanban remains the task/event store; this
+-- row is the project-level status that web and messaging surfaces can read
+-- without reconstructing policy from a pile of cards.
+CREATE TABLE IF NOT EXISTS project_progress (
+    project_id             TEXT PRIMARY KEY REFERENCES projects(id) ON DELETE CASCADE,
+    phase                  TEXT NOT NULL DEFAULT 'planning',
+    milestone              TEXT,
+    summary                TEXT,
+    next_action            TEXT,
+    last_card_id           TEXT,
+    last_verified_card_id  TEXT,
+    counts_json            TEXT NOT NULL DEFAULT '{}',
+    approval_policy        TEXT NOT NULL DEFAULT 'code_card_requires_approval',
+    updated_at             INTEGER NOT NULL
+);
+
+-- A code card proposal is not a Kanban card until the operator approves it.
+-- request_json is the complete immutable creation payload, so approval works
+-- identically from Telegram and the web dashboard after a process restart.
+CREATE TABLE IF NOT EXISTS project_card_approvals (
+    id               TEXT PRIMARY KEY,
+    project_id       TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    action           TEXT NOT NULL,
+    source_card_id   TEXT,
+    title            TEXT NOT NULL,
+    shell_key        TEXT NOT NULL,
+    request_json     TEXT NOT NULL,
+    dedupe_key       TEXT NOT NULL,
+    status           TEXT NOT NULL DEFAULT 'pending',
+    requested_by     TEXT,
+    decision_reason  TEXT,
+    created_at       INTEGER NOT NULL,
+    decided_at       INTEGER,
+    decided_by       TEXT,
+    created_task_id  TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_project_card_approvals_project_status
+    ON project_card_approvals(project_id, status, created_at);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_project_card_approvals_open_dedupe
+    ON project_card_approvals(project_id, dedupe_key)
+    WHERE status IN ('pending', 'approved');
+
+-- One governed source repository per Project. Card branches/worktrees remain
+-- in Kanban, while repo provisioning and push state belong to the Project DB.
+CREATE TABLE IF NOT EXISTS project_repositories (
+    project_id          TEXT PRIMARY KEY REFERENCES projects(id) ON DELETE CASCADE,
+    mode                TEXT NOT NULL DEFAULT 'none',
+    provider            TEXT,
+    local_path          TEXT,
+    remote_name         TEXT,
+    remote_url          TEXT,
+    visibility          TEXT,
+    default_branch      TEXT NOT NULL DEFAULT 'main',
+    integration_branch  TEXT,
+    status              TEXT NOT NULL DEFAULT 'unconfigured',
+    last_error          TEXT,
+    current_branch      TEXT,
+    base_sha            TEXT,
+    head_sha            TEXT,
+    last_card_id        TEXT,
+    last_commit_sha     TEXT,
+    last_pushed_sha     TEXT,
+    updated_at          INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS project_git_events (
+    id          TEXT PRIMARY KEY,
+    project_id  TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    card_id     TEXT,
+    event_type  TEXT NOT NULL,
+    branch      TEXT,
+    sha         TEXT,
+    remote      TEXT,
+    status      TEXT NOT NULL,
+    detail      TEXT,
+    created_at  INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_project_git_events_project_created
+    ON project_git_events(project_id, created_at, id);
 """
 
 
@@ -136,6 +219,14 @@ def normalize_slug(slug: Optional[str]) -> Optional[str]:
 
 def _new_project_id() -> str:
     return "p_" + secrets.token_hex(4)
+
+
+def _new_approval_id() -> str:
+    return "pa_" + secrets.token_hex(4)
+
+
+def _new_git_event_id() -> str:
+    return "pge_" + secrets.token_hex(4)
 
 
 def _now() -> int:
@@ -204,7 +295,7 @@ def connect_closing(db_path: Optional[Path] = None):
 # TEXT columns added to `projects` after v1; re-applied idempotently on every
 # open so a legacy DB upgrades in place.
 _OPTIONAL_PROJECT_COLUMNS = ("board_slug", "primary_path", "icon", "color")
-VALID_PROJECT_STATUSES = frozenset({"active", "completed"})
+VALID_PROJECT_STATUSES = frozenset({"active", "paused", "completed"})
 
 
 def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
@@ -640,7 +731,7 @@ def set_project_status(
     project_id: str,
     status: str,
 ) -> bool:
-    """Transition a project between ``active`` and ``completed``.
+    """Transition a project between ``active``, ``paused``, and ``completed``.
 
     Card state is validated by the Project/Card Controller before this store
     function is called.  Keeping that policy out of this low-level module lets
@@ -661,6 +752,300 @@ def set_project_status(
             (normalized, completed_at, now, project_id),
         )
     return cur.rowcount > 0
+
+
+# ---------------------------------------------------------------------------
+# Project progress + operator approval gate
+# ---------------------------------------------------------------------------
+
+
+def _row_dict(row: Optional[sqlite3.Row]) -> Optional[dict]:
+    return dict(row) if row is not None else None
+
+
+def get_project_progress(
+    conn: sqlite3.Connection,
+    project_id: str,
+) -> Optional[dict]:
+    row = conn.execute(
+        "SELECT * FROM project_progress WHERE project_id = ?",
+        (project_id,),
+    ).fetchone()
+    if row is None:
+        return None
+    result = dict(row)
+    try:
+        result["counts"] = json.loads(result.pop("counts_json") or "{}")
+    except (TypeError, ValueError, json.JSONDecodeError):
+        result["counts"] = {}
+        result.pop("counts_json", None)
+    return result
+
+
+def upsert_project_progress(
+    conn: sqlite3.Connection,
+    project_id: str,
+    *,
+    phase: str,
+    counts: Optional[dict] = None,
+    milestone: Optional[str] = None,
+    summary: Optional[str] = None,
+    next_action: Optional[str] = None,
+    last_card_id: Optional[str] = None,
+    last_verified_card_id: Optional[str] = None,
+    approval_policy: str = "code_card_requires_approval",
+) -> dict:
+    if get_project(conn, project_id) is None:
+        raise ValueError(f"no such project: {project_id}")
+    normalized_phase = str(phase or "planning").strip().lower()
+    now = _now()
+    with write_txn(conn):
+        conn.execute(
+            "INSERT INTO project_progress "
+            "(project_id, phase, milestone, summary, next_action, last_card_id, "
+            " last_verified_card_id, counts_json, approval_policy, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+            "ON CONFLICT(project_id) DO UPDATE SET "
+            "phase=excluded.phase, milestone=excluded.milestone, "
+            "summary=excluded.summary, next_action=excluded.next_action, "
+            "last_card_id=excluded.last_card_id, "
+            "last_verified_card_id=excluded.last_verified_card_id, "
+            "counts_json=excluded.counts_json, "
+            "approval_policy=excluded.approval_policy, updated_at=excluded.updated_at",
+            (
+                project_id,
+                normalized_phase,
+                str(milestone).strip() if milestone else None,
+                str(summary).strip() if summary else None,
+                str(next_action).strip() if next_action else None,
+                str(last_card_id).strip() if last_card_id else None,
+                str(last_verified_card_id).strip() if last_verified_card_id else None,
+                json.dumps(counts or {}, ensure_ascii=False, sort_keys=True),
+                str(approval_policy or "code_card_requires_approval").strip(),
+                now,
+            ),
+        )
+    return get_project_progress(conn, project_id) or {}
+
+
+def create_card_approval(
+    conn: sqlite3.Connection,
+    *,
+    project_id: str,
+    action: str,
+    title: str,
+    shell_key: str,
+    request: dict,
+    dedupe_key: str,
+    source_card_id: Optional[str] = None,
+    requested_by: Optional[str] = None,
+) -> dict:
+    """Persist an idempotent operator approval request for a future code card."""
+    if get_project(conn, project_id) is None:
+        raise ValueError(f"no such project: {project_id}")
+    key = str(dedupe_key or "").strip()
+    if not key:
+        raise ValueError("approval dedupe_key is required")
+    existing = conn.execute(
+        "SELECT * FROM project_card_approvals WHERE project_id = ? "
+        "AND dedupe_key = ? AND status IN ('pending', 'approved') "
+        "ORDER BY created_at DESC LIMIT 1",
+        (project_id, key),
+    ).fetchone()
+    if existing is not None:
+        return card_approval_from_row(existing)
+    approval_id = _new_approval_id()
+    now = _now()
+    with write_txn(conn):
+        conn.execute(
+            "INSERT INTO project_card_approvals "
+            "(id, project_id, action, source_card_id, title, shell_key, "
+            " request_json, dedupe_key, status, requested_by, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)",
+            (
+                approval_id,
+                project_id,
+                str(action or "add_project_card").strip(),
+                str(source_card_id).strip() if source_card_id else None,
+                str(title or "").strip(),
+                str(shell_key or "code").strip(),
+                json.dumps(request, ensure_ascii=False, sort_keys=True),
+                key,
+                str(requested_by).strip() if requested_by else None,
+                now,
+            ),
+        )
+    return get_card_approval(conn, approval_id) or {}
+
+
+def card_approval_from_row(row: sqlite3.Row) -> dict:
+    result = dict(row)
+    try:
+        result["request"] = json.loads(result.pop("request_json") or "{}")
+    except (TypeError, ValueError, json.JSONDecodeError):
+        result["request"] = {}
+        result.pop("request_json", None)
+    return result
+
+
+def get_card_approval(
+    conn: sqlite3.Connection,
+    approval_id: str,
+) -> Optional[dict]:
+    row = conn.execute(
+        "SELECT * FROM project_card_approvals WHERE id = ?",
+        (approval_id,),
+    ).fetchone()
+    return card_approval_from_row(row) if row is not None else None
+
+
+def list_card_approvals(
+    conn: sqlite3.Connection,
+    project_id: str,
+    *,
+    statuses: Optional[Iterable[str]] = None,
+) -> List[dict]:
+    normalized = [str(item).strip().lower() for item in statuses or () if str(item).strip()]
+    sql = "SELECT * FROM project_card_approvals WHERE project_id = ?"
+    params: List[object] = [project_id]
+    if normalized:
+        sql += " AND status IN (" + ",".join("?" for _ in normalized) + ")"
+        params.extend(normalized)
+    sql += " ORDER BY created_at ASC, id ASC"
+    return [card_approval_from_row(row) for row in conn.execute(sql, params).fetchall()]
+
+
+def update_card_approval(
+    conn: sqlite3.Connection,
+    approval_id: str,
+    *,
+    status: str,
+    decided_by: Optional[str] = None,
+    decision_reason: Optional[str] = None,
+    created_task_id: Optional[str] = None,
+) -> Optional[dict]:
+    normalized = str(status or "").strip().lower()
+    if normalized not in {"pending", "approved", "rejected", "consumed"}:
+        raise ValueError("invalid project card approval status")
+    now = _now()
+    with write_txn(conn):
+        cur = conn.execute(
+            "UPDATE project_card_approvals SET status = ?, decided_at = ?, "
+            "decided_by = COALESCE(?, decided_by), "
+            "decision_reason = COALESCE(?, decision_reason), "
+            "created_task_id = COALESCE(?, created_task_id) WHERE id = ?",
+            (
+                normalized,
+                now if normalized != "pending" else None,
+                str(decided_by).strip() if decided_by else None,
+                str(decision_reason).strip() if decision_reason else None,
+                str(created_task_id).strip() if created_task_id else None,
+                approval_id,
+            ),
+        )
+    return get_card_approval(conn, approval_id) if cur.rowcount else None
+
+
+# ---------------------------------------------------------------------------
+# Project repository + Git audit state
+# ---------------------------------------------------------------------------
+
+
+def get_project_repository(
+    conn: sqlite3.Connection,
+    project_id: str,
+) -> Optional[dict]:
+    return _row_dict(
+        conn.execute(
+            "SELECT * FROM project_repositories WHERE project_id = ?",
+            (project_id,),
+        ).fetchone()
+    )
+
+
+def upsert_project_repository(
+    conn: sqlite3.Connection,
+    project_id: str,
+    **fields,
+) -> dict:
+    if get_project(conn, project_id) is None:
+        raise ValueError(f"no such project: {project_id}")
+    allowed = {
+        "mode", "provider", "local_path", "remote_name", "remote_url",
+        "visibility", "default_branch", "integration_branch", "status",
+        "last_error", "current_branch", "base_sha", "head_sha",
+        "last_card_id", "last_commit_sha", "last_pushed_sha",
+    }
+    unknown = set(fields) - allowed
+    if unknown:
+        raise ValueError(f"unknown repository fields: {sorted(unknown)}")
+    existing = get_project_repository(conn, project_id) or {
+        "mode": "none",
+        "default_branch": "main",
+        "status": "unconfigured",
+    }
+    merged = {key: fields.get(key, existing.get(key)) for key in allowed}
+    now = _now()
+    columns = ["project_id", *sorted(allowed), "updated_at"]
+    values = [project_id, *(merged.get(key) for key in sorted(allowed)), now]
+    updates = ", ".join(
+        f"{key}=excluded.{key}" for key in [*sorted(allowed), "updated_at"]
+    )
+    with write_txn(conn):
+        conn.execute(
+            f"INSERT INTO project_repositories ({', '.join(columns)}) "
+            f"VALUES ({', '.join('?' for _ in columns)}) "
+            f"ON CONFLICT(project_id) DO UPDATE SET {updates}",
+            values,
+        )
+    return get_project_repository(conn, project_id) or {}
+
+
+def record_git_event(
+    conn: sqlite3.Connection,
+    *,
+    project_id: str,
+    event_type: str,
+    status: str,
+    card_id: Optional[str] = None,
+    branch: Optional[str] = None,
+    sha: Optional[str] = None,
+    remote: Optional[str] = None,
+    detail: Optional[str] = None,
+) -> dict:
+    event_id = _new_git_event_id()
+    now = _now()
+    with write_txn(conn):
+        conn.execute(
+            "INSERT INTO project_git_events "
+            "(id, project_id, card_id, event_type, branch, sha, remote, status, detail, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                event_id, project_id, card_id, str(event_type).strip(), branch,
+                sha, remote, str(status).strip(), detail, now,
+            ),
+        )
+    row = conn.execute(
+        "SELECT * FROM project_git_events WHERE id = ?", (event_id,)
+    ).fetchone()
+    return dict(row)
+
+
+def list_git_events(
+    conn: sqlite3.Connection,
+    project_id: str,
+    *,
+    limit: int = 50,
+) -> List[dict]:
+    rows = conn.execute(
+        "SELECT * FROM project_git_events WHERE project_id = ? "
+        # ``created_at`` is second-resolution; multiple controller events often
+        # land in the same second.  Random text ids are not chronological, so
+        # use SQLite insertion order as the deterministic tie-breaker.
+        "ORDER BY created_at DESC, rowid DESC LIMIT ?",
+        (project_id, max(1, min(int(limit), 500))),
+    ).fetchall()
+    return [dict(row) for row in rows]
 
 
 # ---------------------------------------------------------------------------

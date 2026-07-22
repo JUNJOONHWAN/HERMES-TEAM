@@ -716,7 +716,7 @@
         if (assigneeFilter && t.assignee !== assigneeFilter) return false;
         if (projectFilter && t.project_id !== projectFilter) return false;
         if (q) {
-          const hay = `${t.id} ${t.title || ""} ${t.body || ""} ${t.result || ""} ${t.latest_summary || ""} ${t.assignee || ""} ${t.tenant || ""}`.toLowerCase();
+          const hay = `${t.project_id || ""} ${t.id} ${t.title || ""} ${t.body || ""} ${t.result || ""} ${t.latest_summary || ""} ${t.assignee || ""} ${t.tenant || ""}`.toLowerCase();
           if (hay.indexOf(q) === -1) return false;
         }
         return true;
@@ -1000,6 +1000,26 @@
       });
     }, [loadBoard, loadProjects]);
 
+    const decideProjectApproval = useCallback(function (approvalId, action) {
+      return SDK.fetchJSON(`${API}/projects/approvals/${encodeURIComponent(approvalId)}/${action}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ decided_by: "dashboard-operator" }),
+      }).then(function (res) {
+        return Promise.all([loadProjects(), loadBoard()]).then(function () { return res; });
+      });
+    }, [loadBoard, loadProjects]);
+
+    const configureProjectRepository = useCallback(function (projectId, payload) {
+      return SDK.fetchJSON(`${API}/projects/${encodeURIComponent(projectId)}/repository`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      }).then(function (res) {
+        return loadProjects().then(function () { return res; });
+      });
+    }, [loadProjects]);
+
     const chooseProject = useCallback(function (projectId) {
       const selected = projects.find(function (p) { return p.id === projectId; });
       setProjectFilter(projectId || "");
@@ -1105,6 +1125,8 @@
           onSelect: chooseProject,
           onStart: startProject,
           onAddCard: addProjectCard,
+          onApproval: decideProjectApproval,
+          onRepository: configureProjectRepository,
           onStatus: setProjectStatus,
         }),
         showNewBoard ? h(NewBoardDialog, {
@@ -2121,6 +2143,22 @@
         "",
       );
       if (primaryPath === null) return;
+      const repoMode = window.prompt(
+        "Repository setup: none, existing, init_local, or github",
+        shell.trim() === "code" ? "github" : "none",
+      );
+      if (repoMode === null || !repoMode.trim()) return;
+      let githubRepo = null;
+      let repoVisibility = "private";
+      if (repoMode.trim() === "github") {
+        githubRepo = window.prompt(
+          "GitHub repository name or owner/name (blank uses the Project slug)",
+          "",
+        );
+        if (githubRepo === null) return;
+        repoVisibility = window.prompt("GitHub visibility: private or public", "private");
+        if (repoVisibility === null || !repoVisibility.trim()) return;
+      }
       const acceptance = window.prompt(
         "Acceptance criteria (one per line)",
         "Requested result is complete\nRelevant validation passes\nEvidence is attached to the card",
@@ -2132,10 +2170,16 @@
         goal: goal.trim(),
         shell_key: shell.trim(),
         primary_path: primaryPath.trim() || null,
+        repo_mode: repoMode.trim(),
+        github_repo: githubRepo && githubRepo.trim() ? githubRepo.trim() : null,
+        repo_visibility: repoVisibility.trim(),
         acceptance_criteria: acceptance.split("\n").map(function (s) { return s.trim(); }).filter(Boolean),
       }).then(function (res) {
         const id = res && res.project && res.project.id;
-        setMsg({ ok: true, text: `Project started${id ? `: ${id}` : ""}` });
+        const approvalId = res && res.approval_request && res.approval_request.id;
+        setMsg({ ok: true, text: approvalId
+          ? `Project ${id} · code approval ${approvalId} pending`
+          : `Project started${id ? `: ${id}` : ""}` });
       }).catch(function (e) {
         setMsg({ ok: false, text: parseApiErrorMessage(e) });
       }).finally(function () { setBusy(false); });
@@ -2146,10 +2190,16 @@
       if (action === "close" && !window.confirm(
         "Close this project? Every card must already be done or archived.",
       )) return;
+      if (action === "pause" && !window.confirm(
+        "Pause this project? No new cards can be issued until it is reopened.",
+      )) return;
       setBusy(true); setMsg(null);
       props.onStatus(selected.id, action)
         .then(function () {
-          setMsg({ ok: true, text: action === "close" ? "Project closed." : "Project reopened." });
+          const text = action === "close"
+            ? "Project closed."
+            : (action === "pause" ? "Project paused." : "Project reopened.");
+          setMsg({ ok: true, text: text });
         })
         .catch(function (e) { setMsg({ ok: false, text: parseApiErrorMessage(e) }); })
         .finally(function () { setBusy(false); });
@@ -2176,7 +2226,63 @@
         acceptance_criteria: acceptance.split("\n").map(function (s) { return s.trim(); }).filter(Boolean),
       }).then(function (res) {
         const id = res && res.card && res.card.id;
-        setMsg({ ok: true, text: `New root card created${id ? `: ${id}` : ""}` });
+        const approvalId = res && res.approval_request && res.approval_request.id;
+        setMsg({ ok: true, text: approvalId
+          ? `Project ${selected.id} · code approval ${approvalId} pending`
+          : id
+            ? `Project ${selected.id} · root card ${id}`
+            : `Project ${selected.id} · root card created` });
+      }).catch(function (e) {
+        setMsg({ ok: false, text: parseApiErrorMessage(e) });
+      }).finally(function () { setBusy(false); });
+    };
+
+    const decideApproval = function (approvalId, action) {
+      if (busy) return;
+      const verb = action === "approve" ? "approve and create" : "reject";
+      if (!window.confirm(`${verb} code card request ${approvalId}?`)) return;
+      setBusy(true); setMsg(null);
+      props.onApproval(approvalId, action)
+        .then(function (res) {
+          const cardId = res && res.card && res.card.id;
+          setMsg({ ok: true, text: cardId
+            ? `Project ${selected.id} · card ${cardId} created from ${approvalId}`
+            : `Project ${selected.id} · ${approvalId} rejected` });
+        })
+        .catch(function (e) { setMsg({ ok: false, text: parseApiErrorMessage(e) }); })
+        .finally(function () { setBusy(false); });
+    };
+
+    const configureRepo = function () {
+      if (!selected || busy) return;
+      const mode = window.prompt(
+        "Repository setup: existing, init_local, github, or none",
+        selected.repository && selected.repository.mode !== "none"
+          ? selected.repository.mode : "github",
+      );
+      if (mode === null || !mode.trim()) return;
+      const path = window.prompt("Local project folder", selected.primary_path || "");
+      if (path === null) return;
+      let githubRepo = null;
+      let visibility = "private";
+      if (mode.trim() === "github") {
+        githubRepo = window.prompt(
+          "GitHub repository name or owner/name (blank uses the Project slug)",
+          selected.slug || "",
+        );
+        if (githubRepo === null) return;
+        visibility = window.prompt("GitHub visibility: private or public", "private");
+        if (visibility === null || !visibility.trim()) return;
+      }
+      setBusy(true); setMsg(null);
+      props.onRepository(selected.id, {
+        mode: mode.trim(),
+        local_path: path.trim() || null,
+        github_repo: githubRepo && githubRepo.trim() ? githubRepo.trim() : null,
+        visibility: visibility.trim(),
+      }).then(function (res) {
+        const repo = res && res.repository;
+        setMsg({ ok: true, text: `Project ${selected.id} · repository ${repo && repo.status}` });
       }).catch(function (e) {
         setMsg({ ok: false, text: parseApiErrorMessage(e) });
       }).finally(function () { setBusy(false); });
@@ -2197,9 +2303,11 @@
           }, selectChangeHandler(props.onSelect)),
             h(SelectOption, { value: "" }, "All project and standalone cards"),
             list.map(function (p) {
-              const status = p.status === "completed" ? "closed" : "active";
+              const status = p.status === "completed"
+                ? "closed"
+                : (p.status === "paused" ? "paused" : "active");
               return h(SelectOption, { key: p.id, value: p.id },
-                `${p.name} · ${status} · ${p.card_count || 0} cards`);
+                `${p.id} · ${p.name} · ${status} · ${p.card_count || 0} cards`);
             }),
           ),
           h(Button, { size: "sm", disabled: busy, onClick: start },
@@ -2210,9 +2318,17 @@
           }, "+ New root card") : null,
           selected && selected.status === "active" ? h(Button, {
             size: "sm", variant: "outline", disabled: busy,
+            onClick: configureRepo,
+          }, "Repository") : null,
+          selected && selected.status === "active" ? h(Button, {
+            size: "sm", variant: "outline", disabled: busy,
             onClick: function () { changeStatus("close"); },
           }, "Close") : null,
-          selected && selected.status === "completed" ? h(Button, {
+          selected && selected.status === "active" ? h(Button, {
+            size: "sm", variant: "outline", disabled: busy,
+            onClick: function () { changeStatus("pause"); },
+          }, "Pause") : null,
+          selected && ["paused", "completed"].indexOf(selected.status) !== -1 ? h(Button, {
             size: "sm", variant: "outline", disabled: busy,
             onClick: function () { changeStatus("reopen"); },
           }, "Reopen") : null,
@@ -2222,8 +2338,29 @@
         `${selected.id} · board=${selected.board || props.board} · threads=${selected.thread_count || 0} · ` +
         `open=${Object.keys(selected.counts || {}).reduce(function (n, k) {
           return n + (["done", "archived"].indexOf(k) === -1 ? (selected.counts[k] || 0) : 0);
-        }, 0)}`,
+        }, 0)} · phase=${selected.progress && selected.progress.phase || "planning"} · ` +
+        `milestone=${selected.progress && selected.progress.milestone || "-"}`,
       ) : null,
+      selected && selected.repository ? h("div", { className: "text-xs mt-1 text-muted-foreground" },
+        `repo=${selected.repository.status} · mode=${selected.repository.mode} · ` +
+        `branch=${selected.repository.current_branch || selected.repository.default_branch || "-"} · ` +
+        `push=${selected.repository.last_pushed_sha || "not pushed"}`,
+      ) : null,
+      selected && (selected.approval_requests || []).length ? h("div", {
+        className: "mt-2 flex flex-col gap-1",
+      }, (selected.approval_requests || []).map(function (approval) {
+        return h("div", { key: approval.id, className: "flex flex-wrap items-center gap-2 text-xs" },
+          h("span", null, `${selected.id} · ${approval.id} · ${approval.title}`),
+          h(Button, {
+            size: "sm", disabled: busy,
+            onClick: function () { decideApproval(approval.id, "approve"); },
+          }, "Approve code card"),
+          h(Button, {
+            size: "sm", variant: "outline", disabled: busy,
+            onClick: function () { decideApproval(approval.id, "reject"); },
+          }, "Reject"),
+        );
+      })) : null,
       msg ? h("div", {
         className: msg.ok ? "hermes-kanban-msg-ok" : "hermes-kanban-msg-err",
       }, msg.text) : null,
@@ -2971,7 +3108,7 @@
       draggable: true,
       tabIndex: 0,
       role: "button",
-      "aria-label": `${t.title || "untitled"} — ${t.id} — ${t.status}`,
+      "aria-label": `${t.title || "untitled"} — ${t.project_id ? `${t.project_id} — ` : ""}${t.id} — ${t.status}`,
       onDragStart: handleDragStart,
       onClick: handleClick,
       onKeyDown: handleKeyDown,
@@ -2993,7 +3130,10 @@
               }),
             ),
             h("span", { className: "hermes-kanban-card-id",
-                        title: `Task id: ${t.id}. Use this id with kanban_show, /kanban show, or hermes kanban show.` }, t.id),
+                        title: t.project_id
+                          ? `Project id: ${t.project_id}. Card id: ${t.id}.`
+                          : `Task id: ${t.id}. Use this id with kanban_show, /kanban show, or hermes kanban show.` },
+              t.project_id ? `${t.project_id} · ${t.id}` : t.id),
             t.warnings && t.warnings.count > 0
               ? h("span", {
                   className: cn(
@@ -3772,7 +3912,8 @@
           const created = cards && cards.length
             ? cards.map(function (c) { return c.id; }).join(", ")
             : (res && res.card && res.card.id);
-          setMsg({ ok: true, text: `${action} created${created ? `: ${created}` : "."}` });
+          setMsg({ ok: true, text: `${action} · project ${task.project_id}` +
+            (created ? ` · card ${created}` : "") });
         })
         .catch(function (e) { setMsg({ ok: false, text: parseApiErrorMessage(e) }); })
         .finally(function () { setBusy(false); });

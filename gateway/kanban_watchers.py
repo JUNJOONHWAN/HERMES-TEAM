@@ -40,6 +40,16 @@ def _kst_timestamp(value: Optional[int]) -> Optional[str]:
         return None
 
 
+def _notification_identity(task: Any, task_id: str) -> str:
+    """Render the stable Project/Card identity shown to operators."""
+    project_id = getattr(task, "project_id", None) if task is not None else None
+    lines: list[str] = []
+    if project_id:
+        lines.append(f"프로젝트: {project_id}")
+    lines.append(f"카드: {task_id}")
+    return "\n".join(lines)
+
+
 def _completion_provenance(conn: sqlite3.Connection, task: Any) -> str:
     """Render the actual controller -> role -> executor responsibility chain.
 
@@ -465,7 +475,19 @@ class GatewayKanbanWatchersMixin:
                             board_slug,
                         )
                         continue
+                    # Archive is an explicit final supersession.  A delayed
+                    # ``gave_up -> archived`` backlog must not replay an old
+                    # failure after a recovery has already replaced the card.
+                    if task is not None and task.status == "archived":
+                        await asyncio.to_thread(
+                            self._kanban_advance, sub, d["cursor"], board_slug,
+                        )
+                        await asyncio.to_thread(
+                            self._kanban_unsub, sub, board_slug,
+                        )
+                        continue
                     title = (task.title if task else sub["task_id"])[:120]
+                    identity = _notification_identity(task, sub["task_id"])
                     # The DB cursor is claimed for the whole event batch before
                     # network delivery. Track progress inside that batch so a
                     # failure after one successful send rewinds only to the
@@ -491,7 +513,7 @@ class GatewayKanbanWatchersMixin:
                             )
                             msg = (
                                 f"✅ 완료 · {title}\n"
-                                f"카드: {sub['task_id']}"
+                                f"{identity}"
                                 f"{provenance_block}"
                                 f"{handoff}"
                             )
@@ -501,7 +523,7 @@ class GatewayKanbanWatchersMixin:
                                 reason = f": {str(ev.payload['reason'])[:160]}"
                             msg = (
                                 f"⏸ 중단 · {title}\n"
-                                f"카드: {sub['task_id']}{reason}"
+                                f"{identity}{reason}"
                             )
                         elif kind == "gave_up":
                             err = ""
@@ -509,7 +531,7 @@ class GatewayKanbanWatchersMixin:
                                 err = f"\n{str(ev.payload['error'])[:200]}"
                             msg = (
                                 f"⛔ 실행 실패 · {title}\n"
-                                f"카드: {sub['task_id']}{err}"
+                                f"{identity}{err}"
                             )
                         elif kind == "crashed":
                             # Automatic retry is internal lifecycle noise.
@@ -623,6 +645,10 @@ class GatewayKanbanWatchersMixin:
                                 _session_key = getattr(task, "session_id", None) or ""
                                 if _session_key:
                                     _title = (task.title if task else sub["task_id"])[:120]
+                                    _wake_task_id = sub["task_id"]
+                                    _project_id = getattr(task, "project_id", None)
+                                    if _project_id:
+                                        _wake_task_id = f"{_project_id} / {sub['task_id']}"
                                     _assignee = task.assignee if task else ""
                                     _parts = []
                                     if "completed" in _wake_kinds: _parts.append(t("gateway.kanban.wake.completed"))
@@ -633,7 +659,7 @@ class GatewayKanbanWatchersMixin:
                                     _status = t("gateway.kanban.wake.status_joiner").join(_parts) or t("gateway.kanban.wake.status_default")
                                     _synth = t(
                                         "gateway.kanban.wake.message",
-                                        task_id=sub["task_id"],
+                                        task_id=_wake_task_id,
                                         status=_status,
                                         title=_title,
                                         assignee=_assignee,

@@ -56,11 +56,33 @@ def test_web_api_uses_same_native_project_card_controller(
     assert started.status_code == 200, started.text
     body = started.json()
     project_id = body["project"]["id"]
-    root_id = body["card"]["id"]
+    assert body["card"] is None
+    approval_id = body["approval_request"]["id"]
+    approved = project_api_client.post(
+        f"/api/plugins/kanban/projects/approvals/{approval_id}/approve",
+        json={"decided_by": "web-test"},
+    )
+    assert approved.status_code == 200, approved.text
+    root_id = approved.json()["card"]["id"]
 
     projects = project_api_client.get("/api/plugins/kanban/projects")
     assert projects.status_code == 200
     assert projects.json()["projects"][0]["id"] == project_id
+
+    paused = project_api_client.post(
+        f"/api/plugins/kanban/projects/{project_id}/pause"
+    )
+    assert paused.status_code == 200, paused.text
+    assert paused.json()["project"]["status"] == "paused"
+    denied = project_api_client.post(
+        f"/api/plugins/kanban/projects/{project_id}/cards",
+        json={"title": "Denied while paused", "shell_key": "verification"},
+    )
+    assert denied.status_code == 400
+    reopened = project_api_client.post(
+        f"/api/plugins/kanban/projects/{project_id}/reopen"
+    )
+    assert reopened.status_code == 200, reopened.text
 
     independent = project_api_client.post(
         f"/api/plugins/kanban/projects/{project_id}/cards",
@@ -79,7 +101,14 @@ def test_web_api_uses_same_native_project_card_controller(
         json={"title": "Add an intuitive follow-up action"},
     )
     assert follow.status_code == 200, follow.text
-    follow_id = follow.json()["card"]["id"]
+    assert follow.json()["card"] is None
+    follow_approval = follow.json()["approval_request"]["id"]
+    follow_approved = project_api_client.post(
+        f"/api/plugins/kanban/projects/approvals/{follow_approval}/approve",
+        json={"decided_by": "web-test"},
+    )
+    assert follow_approved.status_code == 200, follow_approved.text
+    follow_id = follow_approved.json()["card"]["id"]
 
     inspected = project_api_client.get(
         f"/api/plugins/kanban/cards/{follow_id}/inspect"
@@ -106,8 +135,15 @@ def test_web_api_uses_same_native_project_card_controller(
         },
     )
     assert recovered.status_code == 200, recovered.text
-    assert recovered.json()["card"]["workspace_kind"] == "dir"
-    assert recovered.json()["card"]["workspace_path"] == str(workspace)
+    assert recovered.json()["card"] is None
+    recovery_approval = recovered.json()["approval_request"]["id"]
+    recovered_approved = project_api_client.post(
+        f"/api/plugins/kanban/projects/approvals/{recovery_approval}/approve",
+        json={"decided_by": "web-test"},
+    )
+    assert recovered_approved.status_code == 200, recovered_approved.text
+    assert recovered_approved.json()["card"]["workspace_kind"] == "dir"
+    assert recovered_approved.json()["card"]["workspace_path"] == str(workspace)
 
     # Closing remains a controller invariant, not a UI-side optimistic flag.
     closed = project_api_client.post(
@@ -128,4 +164,8 @@ def test_web_bundle_exposes_independent_root_card_action():
     ).read_text(encoding="utf-8")
 
     assert "/projects/${encodeURIComponent(projectId)}/cards" in bundle
+    assert "/projects/approvals/${encodeURIComponent(approvalId)}/${action}" in bundle
+    assert "Approve code card" in bundle
+    assert "Repository setup: none, existing, init_local, or github" in bundle
     assert "+ New root card" in bundle
+    assert 'changeStatus("pause")' in bundle

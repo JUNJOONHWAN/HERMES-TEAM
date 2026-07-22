@@ -2305,6 +2305,16 @@ def test_dashboard_search_includes_body_and_result():
     assert "t.latest_summary || \"\"" in dist
 
 
+def test_dashboard_project_cards_show_dual_project_and_card_identity():
+    repo_root = Path(__file__).resolve().parents[2]
+    dist = (repo_root / "plugins" / "kanban" / "dashboard" / "dist" / "index.js").read_text()
+
+    assert '`${p.id} · ${p.name} · ${status}' in dist
+    assert 't.project_id ? `${t.project_id} · ${t.id}` : t.id' in dist
+    assert 'Project ${selected.id} · root card ${id}' in dist
+    assert '`${action} · project ${task.project_id}`' in dist
+
+
 def test_dashboard_bulk_actions_include_reclaim_first():
     """Bulk action bar must expose reclaim_first checkbox and expanded status buttons."""
     repo_root = Path(__file__).resolve().parents[2]

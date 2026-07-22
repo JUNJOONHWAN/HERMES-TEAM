@@ -21,6 +21,9 @@ def test_supervisor_toolset_exposes_native_project_controller():
         "action"
     ]["enum"]
     assert "add_project_card" in actions
+    assert "pause_project" in actions
+    assert "approve_code_card" in actions
+    assert "checkpoint_card_git" in actions
 
 
 def _profile(home, name, *, toolsets=(), mcp_servers=(), skills=()):

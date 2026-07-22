@@ -22,6 +22,14 @@ heartbeat configuration.
 9. Optional market memory narrows research; it never grants capabilities.
 10. Heartbeat has exactly three canonical layers: configuration,
     service_schedule, artifacts.
+11. Project state lives in the Project DB; executable work lives in the Kanban
+    DB. Do not infer one by rewriting the other.
+12. A proposed code card creates a `pa_*` approval only. It must not create a
+    `t_*` card, dispatch a worker, or approve itself in the same turn.
+13. A paused Project refuses every card-writing action until an operator
+    explicitly approves the pending proposal or reopens the Project.
+14. Project Git writes use a card branch or integration branch. Workers never
+    push `main` or `master` directly.
 
 ## 0.1 Maintainer release boundary
 
@@ -107,6 +115,52 @@ Never silently fall back to an executor that cannot satisfy the Shell.
 ```
 
 Zero NeuralLink candidates are valid. Omitting the recall record is not.
+
+## 3.1 Project, approval, and Git lifecycle
+
+Long-running work has two linked but separate ledgers:
+
+- `projects.db` owns stable `p_*` identity, phase, milestone, summary,
+  next action, `pa_*` approval requests, repository identity, commit/push
+  receipts, and Git events;
+- `kanban.db` owns immutable executable `t_*` cards, typed links, runs,
+  receipts, comments, notifications, and dispatch state.
+
+The controller is the only writer allowed to translate between them. A worker
+may execute a card or propose a follow-up, but it may not create project graph
+state, approve its own proposal, or mutate a completed card.
+
+For code work, `add_project_card` and `continue_card` first create a durable
+`pa_*` proposal and atomically set the Project to `paused`. At that point no
+Kanban card exists. The operator must use `approve_project_card` from a later
+Telegram, CLI, or Web UI action. Approval reopens the Project and creates
+exactly one `t_*` card; rejection creates none. Repeated submission of the
+same pending proposal returns the existing `pa_*` instead of duplicating it.
+
+`pause_project` refuses while a card is running, clears the active-project
+pointer, and blocks all new card-writing operations. Read-only inspection,
+approval/rejection, repository inspection, and explicit `reopen_project`
+remain available. `close_project` is different: it is a terminal lifecycle
+transition and refuses while open cards or pending approvals exist.
+
+Repository setup supports four explicit modes:
+
+- `none`: no Git lifecycle is managed;
+- `existing`: validate an existing Git repository;
+- `init_local`: initialize local Git and record the initial baseline;
+- `github`: initialize if needed, create or attach a private/public GitHub
+  repository, and persist the remote identity.
+
+Each code card uses its isolated worktree branch. The controller may create a
+checkpoint commit and optionally push that card branch. It rejects direct
+pushes of `main`, `master`, or the repository default branch. Merge or release
+promotion remains a separate operator-authorized operation. Every repository,
+commit, and push transition is written to `project_git_events`.
+
+Telegram notifications and the dashboard must render both `Project: p_*` and
+`Card: t_*`. A new notification subscription starts at the current event
+cursor; terminal/archived subscriptions are removed so old failures cannot be
+replayed as a notification storm.
 
 ## 4. Add or revise a Role Shell
 
@@ -312,6 +366,9 @@ age, optional SHA-256. Do not add arbitrary shell commands to Heartbeat.
 - three Heartbeat layers are interpretable;
 - Receipt validates;
 - Timeline `invalid_count=0`.
+- code-card creation has a distinct, operator-authored approval event;
+- Project phase, pending approvals, and Kanban open-card counts agree;
+- repository branch, commit SHA, push receipt, and Git event history agree.
 
 For a repository-wide public-core release gate, run:
 

@@ -13,6 +13,9 @@ from agent.supervisor_contract import (
     normalize_supervisor_tool_management_delegation,
     supervisor_control_plane_active,
     supervisor_control_tool_required,
+    supervisor_failure_acknowledgement_requested,
+    supervisor_automation_mutation_authorized,
+    supervisor_operator_screen_allowed,
     supervisor_operator_text_from_tool_result,
     supervisor_recovery_tool_name,
     supervisor_required_tool_name,
@@ -150,8 +153,44 @@ def test_supervisor_recovery_tool_is_specific_only_after_violation():
     assert supervisor_recovery_tool_name("그래서 어갭커 현황") == "supervisor_adapter"
     assert supervisor_required_tool_name("그래서 어갭커 현황") == "supervisor_adapter"
     assert supervisor_recovery_tool_name("하트비트 자동화를 고쳐") == "supervisor_delegate"
+    assert supervisor_recovery_tool_name("하트비트가 정상인가? 왜 경고야?") == "supervisor_status"
+    assert supervisor_required_tool_name("하트비트가 정상인가? 왜 경고야?") == "supervisor_status"
+    assert supervisor_required_tool_name("이 실패 확인 처리해서 반복 알리지 마") == "supervisor_automation"
     assert supervisor_recovery_tool_name("역할 셸 현황") == "supervisor_roles"
     assert supervisor_recovery_tool_name("전체 상태 알려줘") == "supervisor_status"
+
+
+def test_failure_acknowledgement_requires_explicit_operator_command():
+    diagnostic = "보고서는 발행됐는데 왜 실패로 보여? 하트비트가 정상인가?"
+    explicit = "일일 보고서 실패는 확인 처리하고 반복 알리지 마"
+
+    assert supervisor_failure_acknowledgement_requested(diagnostic) is False
+    assert supervisor_automation_mutation_authorized(
+        diagnostic, "acknowledge_failures"
+    ) is False
+    assert supervisor_failure_acknowledgement_requested(explicit) is True
+    assert supervisor_automation_mutation_authorized(
+        explicit, "acknowledge_failures"
+    ) is True
+
+
+def test_interpretive_heartbeat_question_keeps_model_answer():
+    question = "하트비트가 정상인가? 보고서는 나갔는데 뭐가 문제야?"
+    assert supervisor_operator_screen_allowed(
+        question,
+        "supervisor_status",
+        {"mode": "deep"},
+    ) is False
+    assert supervisor_operator_screen_allowed(
+        "전체 상태 알려줘",
+        "supervisor_status",
+        {"mode": "snapshot"},
+    ) is True
+    assert supervisor_operator_screen_allowed(
+        "일일 보고서 실패 확인 처리해",
+        "supervisor_automation",
+        {"action": "acknowledge_failures"},
+    ) is False
 
 
 def test_wrong_supervisor_tool_does_not_satisfy_clear_adapter_intent():

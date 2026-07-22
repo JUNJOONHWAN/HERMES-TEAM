@@ -75,11 +75,14 @@ Operating rules:
    report the scheduled.counts totals. required_cron is only a protected
    baseline used to detect deletion; it is never the active automation list.
    Surface failed_enabled_cron, which contains unacknowledged actionable
-   failures. If the user says they have seen a failure, acknowledges it, or
-   asks not to repeat that current failure in heartbeat, immediately call
-   supervisor_automation with action=acknowledge_failures. Never respond only
-   with an explanation that exception logic is absent. Acknowledgement applies
-   to that exact failed run; a later failure of the same job must alert again.
+   failures. A failure acknowledgement is a state mutation: call
+   supervisor_automation with action=acknowledge_failures only when the user
+   explicitly commands Hermes to acknowledge, hide, or stop repeating that
+   exact failure. A question about why a failure appears, a claim that its
+   artifact succeeded, or a request to inspect whether heartbeat is correct is
+   not authorization to acknowledge anything. After status tools, answer the
+   user's actual question with a direct conclusion; return a raw operator_text
+   screen only when the user asked to show the status screen itself.
 7. For an adapter-status question, call supervisor_adapter exactly once with
    action="list" and view="compact". Return its operator_text verbatim, with no
    preface, conclusion, duplicated executor roster, extra supervisor_roles or
@@ -123,6 +126,27 @@ _ADAPTER_REQUEST = re.compile(
 )
 _AUTOMATION_REQUEST = re.compile(
     r"(?:자동화|하트비트|허트비트|크론|스케줄|automation|heartbeat|cron|schedule)",
+    re.IGNORECASE,
+)
+_FAILURE_ACKNOWLEDGEMENT_REQUEST = re.compile(
+    r"(?:"
+    r"(?:실패|경고|오류).{0,20}(?:확인\s*처리|숨겨|감춰|제외해|알리지\s*마|반복하지\s*마)"
+    r"|(?:확인\s*처리|숨겨|감춰|제외해|알리지\s*마|반복하지\s*마).{0,20}(?:실패|경고|오류)"
+    r"|\backnowledge(?:ment)?\b"
+    r")",
+    re.IGNORECASE,
+)
+_FAILURE_ACKNOWLEDGEMENT_CLEAR_REQUEST = re.compile(
+    r"(?:"
+    r"(?:실패|경고|오류).{0,20}(?:확인\s*기록|acknowledgement).{0,12}(?:지워|삭제|초기화|취소|해제|clear)"
+    r"|(?:확인\s*기록|acknowledgement).{0,12}(?:지워|삭제|초기화|취소|해제|clear)"
+    r")",
+    re.IGNORECASE,
+)
+_INTERPRETIVE_STATUS_REQUEST = re.compile(
+    r"(?:왜|뭐가\s*문제|무슨\s*문제|원인|비정상|이상|설명|분석|판정|"
+    r"검토|정상(?:이야|인가|인지|한지|해| 맞)|제대로|실제로|정각|누락|지연|"
+    r"됐는데|나갔(?:는데|잖)|맞(?:아|나|는지|지))",
     re.IGNORECASE,
 )
 _ROLE_REQUEST = re.compile(
@@ -181,6 +205,60 @@ def supervisor_tool_management_delegation_required(user_message: str) -> bool:
     return _TOOL_MANAGEMENT_MUTATION.search(text) is not None
 
 
+def supervisor_failure_acknowledgement_requested(user_message: str) -> bool:
+    """Return True only for an explicit command to suppress one failed run."""
+    text = str(user_message or "").strip()
+    return bool(text and _FAILURE_ACKNOWLEDGEMENT_REQUEST.search(text))
+
+
+def supervisor_automation_mutation_authorized(
+    user_message: str,
+    action: str,
+) -> bool:
+    """Gate acknowledgement mutations on the operator's current utterance."""
+    normalized = str(action or "").strip().lower()
+    if normalized == "acknowledge_failures":
+        return supervisor_failure_acknowledgement_requested(user_message)
+    if normalized == "clear_acknowledgements":
+        text = str(user_message or "").strip()
+        return bool(text and _FAILURE_ACKNOWLEDGEMENT_CLEAR_REQUEST.search(text))
+    return True
+
+
+def supervisor_operator_screen_allowed(
+    user_message: str,
+    tool_name: str,
+    arguments: dict[str, Any] | None = None,
+) -> bool:
+    """Return whether deterministic operator text may replace the real answer.
+
+    Compact screens are useful for direct display requests.  They must never
+    overwrite a model's interpretation of the same evidence or the result of a
+    controller mutation.
+    """
+    text = str(user_message or "").strip()
+    name = str(tool_name or "").strip()
+    args = arguments if isinstance(arguments, dict) else {}
+
+    if name == "supervisor_adapter":
+        return (
+            str(args.get("action") or "list").strip().lower() == "list"
+            and str(args.get("view") or "compact").strip().lower() == "compact"
+            and _ADAPTER_REQUEST.search(text) is not None
+        )
+    if supervisor_repair_delegation_required(text):
+        return False
+    if _INTERPRETIVE_STATUS_REQUEST.search(text):
+        return False
+    if name == "supervisor_status":
+        return True
+    if name == "supervisor_automation":
+        return str(args.get("action") or "list_failures").strip().lower() == "list_failures"
+    if name == "supervisor_roles":
+        return _ROLE_REQUEST.search(text) is not None
+    return False
+
+
 def supervisor_control_plane_active(agent: Any) -> bool:
     """Return whether this agent is the real five-tool controller.
 
@@ -207,8 +285,10 @@ def supervisor_recovery_tool_name(user_message: str) -> str:
         return "supervisor_delegate"
     if supervisor_tool_management_delegation_required(text):
         return "supervisor_delegate"
-    if _AUTOMATION_REQUEST.search(text):
+    if supervisor_failure_acknowledgement_requested(text):
         return "supervisor_automation"
+    if _AUTOMATION_REQUEST.search(text):
+        return "supervisor_status"
     if _ROLE_REQUEST.search(text):
         return "supervisor_roles"
     if _ADAPTER_REQUEST.search(text):
@@ -229,8 +309,10 @@ def supervisor_required_tool_name(user_message: str) -> str | None:
         return "supervisor_delegate"
     if supervisor_tool_management_delegation_required(text):
         return "supervisor_delegate"
-    if _AUTOMATION_REQUEST.search(text):
+    if supervisor_failure_acknowledgement_requested(text):
         return "supervisor_automation"
+    if _AUTOMATION_REQUEST.search(text):
+        return "supervisor_status"
     if _ROLE_REQUEST.search(text):
         return "supervisor_roles"
     if _ADAPTER_REQUEST.search(text):

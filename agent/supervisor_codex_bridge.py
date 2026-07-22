@@ -17,6 +17,7 @@ from typing import Any, Callable, Optional
 from agent.supervisor_contract import (
     SUPERVISOR_CONTROL_TOOL_SEQUENCE,
     SUPERVISOR_DEVELOPER_INSTRUCTIONS,
+    supervisor_automation_mutation_authorized,
 )
 from hermes_constants import get_hermes_home
 from hermes_cli.config import load_config_readonly
@@ -141,6 +142,28 @@ def make_supervisor_dynamic_tool_handler(
                 ensure_ascii=False,
             )
         dispatch_args = dict(args)
+        if name == "supervisor_automation":
+            action = str(
+                dispatch_args.get("action") or "list_failures"
+            ).strip().lower()
+            current_user_message = str(
+                getattr(agent, "_supervisor_current_user_message", "") or ""
+            )
+            if not supervisor_automation_mutation_authorized(
+                current_user_message,
+                action,
+            ):
+                return False, json.dumps(
+                    {
+                        "error": "explicit_operator_authorization_required",
+                        "action": action,
+                        "detail": (
+                            "Failure acknowledgement state can change only "
+                            "after an explicit operator command."
+                        ),
+                    },
+                    ensure_ascii=False,
+                )
         if (
             name == "supervisor_adapter"
             and str(dispatch_args.get("action") or "list").strip().lower() == "list"

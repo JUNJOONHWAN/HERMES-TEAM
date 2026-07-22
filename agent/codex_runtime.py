@@ -16,6 +16,7 @@ compatibility.
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import time
@@ -25,7 +26,12 @@ from typing import Any, Dict, List
 logger = logging.getLogger(__name__)
 
 
-def _apply_supervisor_operator_screen(agent: Any, turn: Any) -> None:
+def _apply_supervisor_operator_screen(
+    agent: Any,
+    turn: Any,
+    *,
+    user_message: str,
+) -> None:
     """Make Codex app-server honor the same deterministic screen contract.
 
     This runtime returns before the regular conversation loop's final-response
@@ -34,12 +40,45 @@ def _apply_supervisor_operator_screen(agent: Any, turn: Any) -> None:
     """
     if not bool(getattr(agent, "_supervisor_mode", False)):
         return
-    from agent.supervisor_contract import supervisor_operator_text_from_tool_result
+    from agent.supervisor_contract import (
+        supervisor_operator_screen_allowed,
+        supervisor_operator_text_from_tool_result,
+    )
 
     projected = list(getattr(turn, "projected_messages", None) or [])
+    calls: dict[str, tuple[str, dict[str, Any]]] = {}
+    for message in projected:
+        if not isinstance(message, dict) or message.get("role") != "assistant":
+            continue
+        for call in message.get("tool_calls") or []:
+            if not isinstance(call, dict):
+                continue
+            call_id = str(call.get("id") or "")
+            function = call.get("function")
+            if not call_id or not isinstance(function, dict):
+                continue
+            name = str(function.get("name") or "")
+            try:
+                arguments = json.loads(function.get("arguments") or "{}")
+            except (TypeError, ValueError, json.JSONDecodeError):
+                arguments = {}
+            if not isinstance(arguments, dict):
+                arguments = {}
+            calls[call_id] = (name, arguments)
+
     operator_text = None
     for message in reversed(projected):
         if not isinstance(message, dict) or message.get("role") != "tool":
+            continue
+        call = calls.get(str(message.get("tool_call_id") or ""))
+        if call is None:
+            continue
+        tool_name, arguments = call
+        if not supervisor_operator_screen_allowed(
+            user_message,
+            tool_name,
+            arguments,
+        ):
             continue
         operator_text = supervisor_operator_text_from_tool_result(
             message.get("content")
@@ -359,6 +398,51 @@ def run_codex_app_server_turn(
             except Exception:
                 logger.debug("codex app-server activity callback raised", exc_info=True)
 
+            params = note.get("params") or {} if isinstance(note, dict) else {}
+            item = params.get("item") or {} if isinstance(params, dict) else {}
+            item_type = str(item.get("type") or "") if isinstance(item, dict) else ""
+
+            def _emit_pending_interim() -> None:
+                pending = str(
+                    getattr(agent, "_codex_pending_interim_text", "") or ""
+                ).strip()
+                agent._codex_pending_interim_text = None
+                if pending:
+                    agent._emit_interim_assistant_message(
+                        {"role": "assistant", "content": pending}
+                    )
+
+            # Codex app-server emits completed agentMessage items while a turn
+            # is still running.  Commentary phases are safe to surface at once.
+            # Older builds omit phase; hold their message until a following
+            # tool or agent message proves it was interim, and never emit the
+            # last phase-less message merely because the turn completed.
+            if event_method == "item/completed" and item_type == "agentMessage":
+                text = str(item.get("text") or "").strip()
+                phase = str(item.get("phase") or "").strip().lower()
+                if phase in {"commentary", "analysis"}:
+                    _emit_pending_interim()
+                    agent._codex_pending_interim_text = None
+                    if text:
+                        agent._emit_interim_assistant_message(
+                            {"role": "assistant", "content": text}
+                        )
+                elif phase in {"final", "final_answer"}:
+                    _emit_pending_interim()
+                else:
+                    _emit_pending_interim()
+                    agent._codex_pending_interim_text = text or None
+            elif event_method in {"item/started", "item/completed"} and item_type in {
+                "commandExecution",
+                "fileChange",
+                "mcpToolCall",
+                "dynamicToolCall",
+            }:
+                _emit_pending_interim()
+            elif event_method == "turn/completed":
+                # The remaining phase-less message is the final answer.
+                agent._codex_pending_interim_text = None
+
             # Bridge Codex app-server item/started notifications to Hermes
             # tool-progress so gateways show verbose "running X" breadcrumbs
             # on this route too (#38835).
@@ -405,9 +489,13 @@ def run_codex_app_server_turn(
     # standard run_conversation() flow (line ~11823) before the early
     # return reaches us. Do NOT append again — that would duplicate.
 
+    agent._codex_pending_interim_text = None
+    if bool(getattr(agent, "_supervisor_mode", False)):
+        agent._supervisor_current_user_message = original_user_message
     try:
         turn = agent._codex_session.run_turn(user_input=user_message)
     except Exception as exc:
+        agent._supervisor_current_user_message = None
         logger.exception("codex app-server turn failed")
         # Crash → unconditionally drop the session so the next turn
         # respawns from scratch instead of reusing a dead client.
@@ -444,7 +532,12 @@ def run_codex_app_server_turn(
             pass
         agent._codex_session = None
 
-    _apply_supervisor_operator_screen(agent, turn)
+    agent._supervisor_current_user_message = None
+    _apply_supervisor_operator_screen(
+        agent,
+        turn,
+        user_message=str(original_user_message or user_message),
+    )
 
     # Splice projected messages into the conversation. The projector emits
     # standard {role, content, tool_calls, tool_call_id} entries, which

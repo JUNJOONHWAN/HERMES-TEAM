@@ -150,6 +150,92 @@ class TestRunConversationCodexPath:
         assert result["final_response"] == operator_text
         assert result["messages"][-1]["content"] == operator_text
 
+    def test_supervisor_interpretive_answer_is_not_overwritten_on_codex_path(
+        self, monkeypatch
+    ):
+        operator_text = "Hermes 주의\nDaily report: RECOVERING"
+        direct_answer = (
+            "아니요. 현재 하트비트 표시는 실제 발송 증거와 맞지 않습니다."
+        )
+
+        def fake_run_turn(self, user_input: str, **kwargs):
+            status_payload = json.dumps(
+                {"operator_text": operator_text}, ensure_ascii=False
+            )
+            acknowledgement_payload = json.dumps(
+                {
+                    "acknowledged": ["daily-report"],
+                    "status": {"operator_text": operator_text},
+                },
+                ensure_ascii=False,
+            )
+            return TurnResult(
+                final_text=direct_answer,
+                projected_messages=[
+                    {
+                        "role": "assistant",
+                        "content": None,
+                        "tool_calls": [
+                            {
+                                "id": "status_1",
+                                "type": "function",
+                                "function": {
+                                    "name": "supervisor_status",
+                                    "arguments": '{"mode":"deep"}',
+                                },
+                            }
+                        ],
+                    },
+                    {
+                        "role": "tool",
+                        "tool_call_id": "status_1",
+                        "content": status_payload,
+                    },
+                    {
+                        "role": "assistant",
+                        "content": None,
+                        "tool_calls": [
+                            {
+                                "id": "ack_1",
+                                "type": "function",
+                                "function": {
+                                    "name": "supervisor_automation",
+                                    "arguments": (
+                                        '{"action":"acknowledge_failures",'
+                                        '"jobs":["daily-report"]}'
+                                    ),
+                                },
+                            }
+                        ],
+                    },
+                    {
+                        "role": "tool",
+                        "tool_call_id": "ack_1",
+                        "content": acknowledgement_payload,
+                    },
+                    {"role": "assistant", "content": direct_answer},
+                ],
+                tool_iterations=2,
+                turn_id="turn-interpretive-1",
+                thread_id="thread-interpretive-1",
+            )
+
+        monkeypatch.setattr(CodexAppServerSession, "run_turn", fake_run_turn)
+        monkeypatch.setattr(
+            CodexAppServerSession,
+            "ensure_started",
+            lambda self: "thread-interpretive-1",
+        )
+        agent = _make_codex_agent()
+        agent._supervisor_mode = True
+
+        result = agent.run_conversation(
+            "하트비트가 정상인가? 보고서는 나갔는데 뭐가 문제야?"
+        )
+
+        assert result["final_response"] == direct_answer
+        assert result["messages"][-1]["content"] == direct_answer
+
     def test_codex_app_server_token_usage_updates_session_accounting(self, monkeypatch):
         def fake_run_turn(self, user_input: str, **kwargs):
             return TurnResult(
@@ -840,3 +926,109 @@ class TestCodexToolProgressBridge:
             agent.run_conversation("keep working")
 
         touch_activity.assert_any_call("codex app-server event: item/completed")
+
+    def test_session_surfaces_codex_commentary_but_not_final_answer(self, monkeypatch):
+        captured_init = {}
+        commentary = []
+
+        def fake_init(self, **kwargs):
+            captured_init.update(kwargs)
+            self._client = None
+
+        def fake_run_turn(self, user_input, **kwargs):
+            on_event = captured_init["on_event"]
+            on_event({"method": "item/completed", "params": {"item": {
+                "type": "agentMessage",
+                "phase": "commentary",
+                "text": "현재 증거를 다시 대조하겠습니다.",
+            }}})
+            on_event({"method": "item/completed", "params": {"item": {
+                "type": "agentMessage",
+                "phase": "final_answer",
+                "text": "최종 답변입니다.",
+            }}})
+            on_event({"method": "turn/completed", "params": {"turn": {
+                "status": "completed",
+            }}})
+            return TurnResult(
+                final_text="최종 답변입니다.",
+                projected_messages=[
+                    {"role": "assistant", "content": "최종 답변입니다."}
+                ],
+                turn_id="t-commentary",
+                thread_id="th-commentary",
+            )
+
+        monkeypatch.setattr(CodexAppServerSession, "__init__", fake_init)
+        monkeypatch.setattr(
+            CodexAppServerSession, "ensure_started", lambda self: "th-commentary"
+        )
+        monkeypatch.setattr(CodexAppServerSession, "run_turn", fake_run_turn)
+
+        agent = _make_codex_agent()
+        agent.interim_assistant_callback = (
+            lambda text, **kwargs: commentary.append((text, kwargs))
+        )
+        with patch.object(agent, "_spawn_background_review", return_value=None):
+            result = agent.run_conversation("상태를 진단해줘")
+
+        assert result["final_response"] == "최종 답변입니다."
+        assert [text for text, _ in commentary] == [
+            "현재 증거를 다시 대조하겠습니다."
+        ]
+
+    def test_phase_less_agent_message_is_released_when_tool_proves_it_interim(
+        self, monkeypatch
+    ):
+        captured_init = {}
+        commentary = []
+
+        def fake_init(self, **kwargs):
+            captured_init.update(kwargs)
+            self._client = None
+
+        def fake_run_turn(self, user_input, **kwargs):
+            on_event = captured_init["on_event"]
+            on_event({"method": "item/completed", "params": {"item": {
+                "type": "agentMessage",
+                "text": "먼저 스냅샷을 확인하겠습니다.",
+            }}})
+            on_event({"method": "item/started", "params": {"item": {
+                "type": "dynamicToolCall",
+                "tool": "supervisor_status",
+                "arguments": {"mode": "deep"},
+            }}})
+            on_event({"method": "item/completed", "params": {"item": {
+                "type": "agentMessage",
+                "text": "직접 답변입니다.",
+            }}})
+            on_event({"method": "turn/completed", "params": {"turn": {
+                "status": "completed",
+            }}})
+            return TurnResult(
+                final_text="직접 답변입니다.",
+                projected_messages=[
+                    {"role": "assistant", "content": "직접 답변입니다."}
+                ],
+                turn_id="t-phase-less",
+                thread_id="th-phase-less",
+            )
+
+        monkeypatch.setattr(CodexAppServerSession, "__init__", fake_init)
+        monkeypatch.setattr(
+            CodexAppServerSession, "ensure_started", lambda self: "th-phase-less"
+        )
+        monkeypatch.setattr(CodexAppServerSession, "run_turn", fake_run_turn)
+
+        agent = _make_codex_agent()
+        agent.tool_progress_callback = lambda *args: None
+        agent.interim_assistant_callback = (
+            lambda text, **kwargs: commentary.append((text, kwargs))
+        )
+        with patch.object(agent, "_spawn_background_review", return_value=None):
+            result = agent.run_conversation("상태를 진단해줘")
+
+        assert result["final_response"] == "직접 답변입니다."
+        assert [text for text, _ in commentary] == [
+            "먼저 스냅샷을 확인하겠습니다."
+        ]

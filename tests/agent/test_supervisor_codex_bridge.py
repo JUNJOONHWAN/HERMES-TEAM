@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from types import SimpleNamespace
 
 import agent.supervisor_codex_bridge as bridge
@@ -44,7 +45,7 @@ def test_context_injects_fixed_identity_control_tools_and_no_mcp(monkeypatch):
     assert "required_cron is only a protected" in context.developer_instructions
     assert "scheduled.jobs" in context.developer_instructions
     assert "action=acknowledge_failures" in context.developer_instructions
-    assert "Never respond only" in context.developer_instructions
+    assert "not authorization to acknowledge anything" in context.developer_instructions
     assert "never a project" in context.developer_instructions
     assert 'workspace_kind="scratch"' in context.developer_instructions
     assert "queued for automatic dispatch" in context.developer_instructions
@@ -135,6 +136,44 @@ def test_dynamic_handler_allowlists_supervisor_tools(monkeypatch):
 
     handler("supervisor_adapter", {"action": "list", "view": "full"})
     assert calls[-1][1]["view"] == "compact"
+
+
+def test_dynamic_handler_rejects_unrequested_failure_acknowledgement(monkeypatch):
+    import tools.supervisor_tools  # noqa: F401
+    from tools.registry import registry as tool_registry
+
+    calls = []
+
+    def dispatch(name, args, **kwargs):
+        calls.append((name, args, kwargs))
+        return '{"acknowledged":["job"]}'
+
+    monkeypatch.setattr(tool_registry, "dispatch", dispatch)
+    monkeypatch.setattr(bridge, "_trusted_notification_route", lambda: None)
+    agent = _agent(
+        _supervisor_current_user_message=(
+            "보고서는 발행됐는데 왜 실패로 보여? 하트비트가 정상인가?"
+        )
+    )
+    handler = bridge.make_supervisor_dynamic_tool_handler(agent)
+
+    success, payload = handler(
+        "supervisor_automation",
+        {"action": "acknowledge_failures", "jobs": ["daily-report"]},
+    )
+    assert success is False
+    assert json.loads(payload)["error"] == "explicit_operator_authorization_required"
+    assert calls == []
+
+    agent._supervisor_current_user_message = (
+        "일일 보고서 실패를 확인 처리하고 반복 알리지 마"
+    )
+    success, _ = handler(
+        "supervisor_automation",
+        {"action": "acknowledge_failures", "jobs": ["daily-report"]},
+    )
+    assert success is True
+    assert len(calls) == 1
 
 
 def test_dynamic_handler_passes_trusted_notification_route(monkeypatch):

@@ -9,6 +9,15 @@ health-gated adapters for execution. OpenCode with dynamically discovered free
 models is the default candidate. Codex, Grok, OpenRouter, local
 OpenAI-compatible endpoints, and generic CLIs are optional adapters.
 
+## Release identity
+
+| Layer | Version |
+|---|---|
+| Hermes distribution family | `0.1.3` |
+| Hermes Agent engine | `0.18.0` |
+
+HERMES-CONTROL must use the same distribution version while retaining the separate engine version.
+
 ## Install HERMES-TEAM
 
 ```bash

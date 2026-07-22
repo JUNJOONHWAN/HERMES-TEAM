@@ -9,6 +9,54 @@ from hermes_cli import kanban_db as kb
 from hermes_cli import supervisor_registry as registry
 
 
+def test_executor_pid_heartbeat_uses_cross_platform_probe(monkeypatch):
+    heartbeats = []
+    monkeypatch.setattr(
+        "gateway.status._pid_exists",
+        lambda pid: pid == 123,
+    )
+    monkeypatch.setattr(
+        executor_adapter.registry,
+        "heartbeat_executor",
+        lambda conn, executor_id, *, health_state: heartbeats.append(
+            (conn, executor_id, health_state)
+        ),
+    )
+
+    marker = object()
+    assert executor_adapter.heartbeat_from_pid(marker, "executor", 123) is True
+    assert executor_adapter.heartbeat_from_pid(marker, "executor", 456) is False
+    assert heartbeats == [
+        (marker, "executor", "healthy"),
+        (marker, "executor", "unhealthy"),
+    ]
+
+
+def test_executor_pid_cancel_uses_windows_tree_termination(monkeypatch):
+    calls = []
+    monkeypatch.setattr(executor_adapter.os, "name", "nt")
+    monkeypatch.setattr(
+        "gateway.status.terminate_pid",
+        lambda pid, *, force: calls.append((pid, force)),
+    )
+
+    assert executor_adapter.cancel_pid(321) is True
+    assert calls == [(321, True)]
+
+
+def test_executor_pid_cancel_uses_posix_process_group(monkeypatch):
+    calls = []
+    monkeypatch.setattr(executor_adapter.os, "name", "posix")
+    monkeypatch.setattr(
+        executor_adapter.os,
+        "killpg",
+        lambda pid, sig: calls.append((pid, sig)),
+    )
+
+    assert executor_adapter.cancel_pid(654) is True
+    assert calls == [(654, executor_adapter.signal.SIGTERM)]
+
+
 def test_external_cli_bridge_closes_market_card_with_optional_policy_and_receipt(
     tmp_path, monkeypatch
 ):

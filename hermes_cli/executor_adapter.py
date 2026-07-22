@@ -345,8 +345,12 @@ def heartbeat_from_pid(conn, executor_id: str, pid: Optional[int]) -> bool:
     if not pid:
         return False
     try:
-        os.kill(int(pid), 0)
+        from gateway.status import _pid_exists
+
+        alive = _pid_exists(int(pid))
     except (OSError, ValueError):
+        alive = False
+    if not alive:
         registry.heartbeat_executor(conn, executor_id, health_state="unhealthy")
         return False
     registry.heartbeat_executor(conn, executor_id, health_state="healthy")
@@ -357,7 +361,12 @@ def cancel_pid(pid: Optional[int]) -> bool:
     if not pid:
         return False
     try:
-        os.killpg(int(pid), signal.SIGTERM)
+        if os.name == "nt":
+            from gateway.status import terminate_pid
+
+            terminate_pid(int(pid), force=True)
+        else:
+            os.killpg(int(pid), signal.SIGTERM)  # windows-footgun: ok — POSIX-only branch
         return True
-    except (ProcessLookupError, PermissionError, ValueError):
+    except (OSError, ValueError):
         return False

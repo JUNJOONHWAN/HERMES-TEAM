@@ -6476,7 +6476,7 @@ def _terminate_reclaimed_worker(
             # supported spawn path uses start_new_session=True.  Signalling
             # the group prevents grandchildren (Codex app-server, shell tools,
             # browser helpers) from surviving after their card is reclaimed.
-            os.killpg(int(pid), sig)
+            os.killpg(int(pid), sig)  # windows-footgun: ok — process_group_mode is POSIX-only
         else:
             os.kill(int(pid), sig)
 
@@ -6487,7 +6487,7 @@ def _terminate_reclaimed_worker(
             # Check the whole spawned process group, not just its leader.  A
             # Codex launcher can exit before descendants, and treating that
             # as fully terminated is the orphan-process bug this path guards.
-            os.killpg(int(pid), 0)
+            os.killpg(int(pid), 0)  # windows-footgun: ok — process_group_mode is POSIX-only
             return True
         except ProcessLookupError:
             return False

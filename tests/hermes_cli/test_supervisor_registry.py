@@ -2028,6 +2028,10 @@ def test_hermes_self_maintenance_has_a_distinct_pinned_shell_and_executor(
     home = tmp_path / "home"
     home.mkdir()
     maintainer_id = "executor_hermes_worker_hermes_maintainer"
+    work_kind_schema = supervisor_tools.SUPERVISOR_DELEGATE_SCHEMA[
+        "parameters"
+    ]["properties"]["work_kind"]
+    assert "hermes_repair" in work_kind_schema["enum"]
     (home / "config.yaml").write_text(
         yaml.safe_dump(
             {

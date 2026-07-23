@@ -13,7 +13,7 @@ OpenAI-compatible endpoints, and generic CLIs are optional adapters.
 
 | Layer | Version |
 |---|---|
-| Hermes distribution family | `0.1.7` |
+| Hermes distribution family | `0.1.8` |
 | Hermes Agent engine | `0.18.0` |
 
 HERMES-CONTROL must use the same distribution version while retaining the separate engine version.

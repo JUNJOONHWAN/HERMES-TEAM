@@ -2107,13 +2107,17 @@ SUPERVISOR_DELEGATE_SCHEMA = {
             },
             "work_kind": {
                 "type": "string",
-                "enum": ["normal", "repair", "tooling"],
+                "enum": ["normal", "repair", "hermes_repair", "tooling"],
                 "description": (
                     "Use repair for bug diagnosis, code fixes, incident recovery, "
-                    "runtime remediation, and automation repair. Repair work is "
-                    "pinned to the configured Codex repair executor. Use tooling "
-                    "for MCP, skill, plugin, or toolset lifecycle work; it is "
-                    "allowed only on tool-management."
+                    "runtime remediation, and automation repair on code/operations; "
+                    "ordinary repair uses the configured lower-cost repair executor. "
+                    "Use hermes_repair only for Hermes controller, adapter, role-shell, "
+                    "router, supervisor configuration, or Hermes runtime-contract "
+                    "maintenance; it is accepted only on hermes-repair and is pinned "
+                    "to the dedicated gpt-5.6-sol/high maintainer. Use tooling for MCP, "
+                    "skill, plugin, or toolset lifecycle work; it is allowed only on "
+                    "tool-management."
                 ),
             },
             "adapter_reason": {"type": "string"},

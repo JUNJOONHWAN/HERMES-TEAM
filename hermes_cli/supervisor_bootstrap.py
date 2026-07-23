@@ -13,6 +13,7 @@ import copy
 import json
 import os
 import shutil
+import sys
 import tempfile
 from datetime import datetime
 from pathlib import Path
@@ -24,7 +25,7 @@ from hermes_cli import kanban_db as kb
 from hermes_cli import supervisor_registry as registry
 from hermes_cli.opencode_free_router import FREE_MODEL_PRIORITY
 from hermes_cli.openrouter_free_router import OPENROUTER_FREE_MODEL_PRIORITY
-from utils import atomic_replace, atomic_yaml_write
+from utils import atomic_json_write, atomic_replace, atomic_yaml_write
 
 
 TIMELINE_MCP = "hermes-timeline-code-map"
@@ -39,6 +40,15 @@ LOCAL_VLLM_GEMMA_MODEL = "google/gemma-4-26b-a4b-it"
 GROK_MODEL = "grok-4"
 OPENCODE_FREE_CONTROLLER_MODELS = tuple(
     model.removeprefix("opencode/") for model in FREE_MODEL_PRIORITY
+)
+ORDINARY_ROLE_KEYS = (
+    "code",
+    "market",
+    "browser-research",
+    "operations",
+    "report",
+    "verification",
+    "tool-management",
 )
 DEFAULT_ARTIFACT_HEALTH: dict[str, Any] = {
     "enabled": False,
@@ -113,6 +123,46 @@ PROFILE_SPECS: dict[str, dict[str, Any]] = {
             "file", "terminal", "kanban", TIMELINE_MCP,
         ],
         "capacity": 1,
+    },
+    "hermes-worker-opencode-free": {
+        "description": (
+            "Dynamic strict-free OpenCode worker. It discovers the live catalog "
+            "before every task and routes through the ordinary Role Shell."
+        ),
+        "provider": "opencode-zen",
+        "model": OPENCODE_FREE_CONTROLLER_MODELS[0],
+        "base_url": "https://opencode.ai/zen/v1",
+        "api_mode": "chat_completions",
+        "reasoning_effort": "medium",
+        "fallback_model": [
+            {"provider": "opencode-zen", "model": model}
+            for model in OPENCODE_FREE_CONTROLLER_MODELS[1:]
+        ],
+        "worker_router": "opencode",
+        "mcp_servers": [TIMELINE_MCP],
+        "capabilities": [
+            "file", "terminal", "web", "browser", "skills", "kanban", "cronjob",
+            TIMELINE_MCP,
+        ],
+        "capacity": 2,
+    },
+    "hermes-worker-openrouter-free": {
+        "description": (
+            "Dynamic strict-free OpenRouter worker. It ranks the live zero-price "
+            "tool-capable catalog and sends an ordered same-request fallback list."
+        ),
+        "provider": "openrouter",
+        "model": OPENROUTER_FREE_MODEL_PRIORITY[0],
+        "base_url": "https://openrouter.ai/api/v1",
+        "api_mode": "chat_completions",
+        "reasoning_effort": "medium",
+        "worker_router": "openrouter",
+        "mcp_servers": [TIMELINE_MCP],
+        "capabilities": [
+            "file", "terminal", "web", "browser", "skills", "kanban", "cronjob",
+            TIMELINE_MCP,
+        ],
+        "capacity": 2,
     },
 }
 
@@ -287,6 +337,10 @@ ROLE_SPECS: dict[str, dict[str, Any]] = {
             "minimum_cases": 20,
             "minimum_overall_pass_rate": 0.95,
             "critical_pass_rate": 1.0,
+            "benchmark_suite": "hermes-repair-v1",
+            "minimum_baseline_score_ratio": 0.95,
+            "maximum_median_latency_ratio": 1.5,
+            "require_benchmark_artifact": True,
             "maximum_default_branch_writes": 0,
             "require_operator_approval": True,
             "require_conflicting_adapter_result_case": True,
@@ -318,6 +372,14 @@ BINDING_SPECS = [
     ("tool-management", "hermes-worker-multitool", 100),
     ("tool-management", "hermes-worker-universal", 5),
     ("hermes-repair", "hermes-worker-hermes-maintainer", 100),
+    *[
+        (shell_key, "hermes-worker-openrouter-free", 4)
+        for shell_key in ORDINARY_ROLE_KEYS
+    ],
+    *[
+        (shell_key, "hermes-worker-opencode-free", 3)
+        for shell_key in ORDINARY_ROLE_KEYS
+    ],
 ]
 
 
@@ -396,18 +458,24 @@ def _profile_config(
     config["mcp_discovery_timeout"] = 15.0
     if any(
         spec.get(name)
-        for name in ("provider", "model", "openai_runtime", "api_mode")
+        for name in (
+            "provider", "model", "base_url", "openai_runtime", "api_mode",
+        )
     ):
         model_config = dict(config.get("model") or {})
         if spec.get("provider"):
             model_config["provider"] = str(spec["provider"])
         if spec.get("model"):
             model_config["default"] = str(spec["model"])
+        if spec.get("base_url"):
+            model_config["base_url"] = str(spec["base_url"])
         if spec.get("openai_runtime"):
             model_config["openai_runtime"] = str(spec["openai_runtime"])
         if spec.get("api_mode"):
             model_config["api_mode"] = str(spec["api_mode"])
         config["model"] = model_config
+    if spec.get("fallback_model"):
+        config["fallback_model"] = copy.deepcopy(spec["fallback_model"])
     if spec.get("reasoning_effort"):
         agent_config = dict(config.get("agent") or {})
         agent_config["reasoning_effort"] = str(spec["reasoning_effort"])
@@ -582,7 +650,100 @@ def _rebind_existing_bindings_to_active_shells(
     return rebound
 
 
-def _install_registry(*, home: Path, controller_config: dict[str, Any]) -> dict[str, Any]:
+def _free_worker_launch_config(
+    *,
+    home: Path,
+    repo_root: Path,
+    profile_name: str,
+    spec: dict[str, Any],
+) -> dict[str, Any]:
+    """Build a trusted bridge around a dynamic strict-free Hermes worker."""
+    router = str(spec["worker_router"])
+    profile_home = home / "profiles" / profile_name
+    engine_argv = [
+        sys.executable,
+        "-m",
+        "hermes_cli.free_worker_router",
+        "--provider",
+        router,
+        "--prompt-file",
+        "{prompt_file}",
+        "--workspace",
+        "{workspace}",
+        "--profile-home",
+        str(profile_home),
+    ]
+    health_argv = [
+        sys.executable,
+        "-m",
+        "hermes_cli.free_worker_router",
+        "--provider",
+        router,
+        "--health-check",
+        "--workspace",
+        str(repo_root),
+        "--profile-home",
+        str(profile_home),
+    ]
+    if router == "opencode":
+        opencode_config = home / "supervisor" / "mcp" / "opencode.json"
+        state_file = home / "supervisor" / "opencode_free_router_state.json"
+        opencode_path = shutil.which("opencode") or "opencode"
+        for argv in (engine_argv, health_argv):
+            argv.extend(
+                [
+                    "--opencode-config",
+                    str(opencode_config),
+                    "--state-file",
+                    str(state_file),
+                    "--opencode",
+                    opencode_path,
+                ]
+            )
+    bridge_argv = [
+        sys.executable,
+        "-m",
+        "hermes_cli.external_cli_adapter",
+        "--prompt-file",
+        "{prompt_file}",
+        "--engine-name",
+        f"{router}-free-hermes-worker",
+        "--engine-argv-json",
+        json.dumps(engine_argv),
+        "--timeline-client",
+        str(repo_root / "scripts" / "hermes_timeline_cli.py"),
+        "--timeline-python",
+        sys.executable,
+        "--timeline-db",
+        str(home / "timeline_code_map" / "graph.db"),
+    ]
+    return {
+        "argv": bridge_argv,
+        "profile": profile_name,
+        "provider": spec["provider"],
+        "model": spec["model"],
+        "api_mode": spec["api_mode"],
+        "reasoning_effort": spec["reasoning_effort"],
+        "capability_enforcement": "env",
+        "health_failure_confirmation_attempts": 2,
+        "tool_contract": {
+            "schema_version": 1,
+            "transport": "adapter_brokered",
+            "adapter_capabilities": list(spec["capabilities"]),
+            "native_capabilities": list(spec["capabilities"]),
+            "required_mcp_servers": [],
+            "probe": {
+                "argv": health_argv,
+                "required_output": ["READY"],
+                "timeout_seconds": 120,
+            },
+        },
+    }
+
+
+def _install_registry(
+    *, home: Path, repo_root: Path, controller_config: dict[str, Any]
+) -> dict[str, Any]:
     shells: dict[str, registry.RoleShell] = {}
     executors: dict[str, registry.Executor] = {}
     bindings: list[registry.Binding] = []
@@ -805,18 +966,28 @@ def _install_registry(*, home: Path, controller_config: dict[str, Any]) -> dict[
             )
         for profile_name, spec in PROFILE_SPECS.items():
             executor_id = f"executor_{profile_name.replace('-', '_')}"
-            launch_config = {"profile": profile_name}
-            for runtime_key in (
-                "provider", "model", "api_mode", "reasoning_effort"
-            ):
-                if spec.get(runtime_key):
-                    launch_config[runtime_key] = spec[runtime_key]
+            adapter_type = "hermes_profile"
+            if spec.get("worker_router"):
+                adapter_type = "command"
+                launch_config = _free_worker_launch_config(
+                    home=home,
+                    repo_root=repo_root,
+                    profile_name=profile_name,
+                    spec=spec,
+                )
+            else:
+                launch_config = {"profile": profile_name}
+                for runtime_key in (
+                    "provider", "model", "api_mode", "reasoning_effort"
+                ):
+                    if spec.get(runtime_key):
+                        launch_config[runtime_key] = spec[runtime_key]
             executors[profile_name] = registry.upsert_executor(
                 conn,
                 executor_id=executor_id,
                 name=profile_name,
                 description=spec["description"],
-                adapter_type="hermes_profile",
+                adapter_type=adapter_type,
                 launch_config=launch_config,
                 capabilities=spec["capabilities"],
                 capacity=int(spec["capacity"]),
@@ -1009,9 +1180,35 @@ def bootstrap_supervisor(
     for name, profile_config in plan["profiles"].items():
         profile_dir = _ensure_profile_dir(home, name)
         atomic_yaml_write(profile_dir / "config.yaml", profile_config, sort_keys=False)
+    opencode_config = home / "supervisor" / "mcp" / "opencode.json"
+    if not opencode_config.exists():
+        atomic_json_write(
+            opencode_config,
+            {
+                "$schema": "https://opencode.ai/config.json",
+                "mcp": {
+                    TIMELINE_MCP: {
+                        "type": "local",
+                        "command": [
+                            sys.executable,
+                            "-m",
+                            "hermes_timeline_code_map.mcp_server",
+                        ],
+                        "environment": {
+                            "TIMELINE_CODE_MAP_DB_PATH": str(
+                                home / "timeline_code_map" / "graph.db"
+                            )
+                        },
+                        "enabled": True,
+                    }
+                },
+            },
+        )
     heartbeat_script = _install_heartbeat_script(home, repo_root)
     atomic_yaml_write(config_path, plan["root"], sort_keys=False)
-    registry_state = _install_registry(home=home, controller_config=plan["root"])
+    registry_state = _install_registry(
+        home=home, repo_root=repo_root, controller_config=plan["root"]
+    )
     heartbeat_job = _install_heartbeat_cron(heartbeat_script)
     summary.update(
         {

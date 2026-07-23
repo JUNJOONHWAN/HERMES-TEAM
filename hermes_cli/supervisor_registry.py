@@ -1458,7 +1458,14 @@ def _controller_adapter_dict(adapter: ControllerAdapter) -> dict[str, Any]:
 def executor_runtime_descriptor(executor: Executor) -> dict[str, Any]:
     """Describe the live backend/model used by a registered executor."""
     if executor.adapter_type != "hermes_profile":
-        backend = _runtime_backend_label(executor.adapter_type, executor.adapter_type)
+        provider = str(
+            executor.launch_config.get("provider") or executor.adapter_type
+        )
+        api_mode = str(executor.launch_config.get("api_mode") or "").strip() or None
+        backend_name = (
+            "codex_app_server" if api_mode == "codex_app_server" else provider
+        )
+        backend = _runtime_backend_label(backend_name, provider)
         model = str(executor.launch_config.get("model") or "operator-managed")
         reasoning = str(executor.launch_config.get("reasoning_effort") or "default")
         endpoint_value = str(executor.launch_config.get("endpoint") or "").strip()
@@ -1473,12 +1480,12 @@ def executor_runtime_descriptor(executor: Executor) -> dict[str, Any]:
         return {
             "profile": None,
             "config_scope": "executor_launch_config",
-            "backend": executor.adapter_type,
+            "backend": backend_name,
             "backend_label": backend,
-            "provider": executor.adapter_type,
+            "provider": provider,
             "model": model,
             "reasoning_effort": reasoning,
-            "api_mode": None,
+            "api_mode": api_mode,
             "endpoint": endpoint,
             "context_length": None,
             "config_state": "registered",
@@ -2775,20 +2782,24 @@ def _executor_runtime_contract_compatible(
             key: executor.launch_config.get(key)
             for key in ("provider", "model", "api_mode", "reasoning_effort")
         }
+    gate = shell.contract.get("replacement_gate")
+    gate = gate if isinstance(gate, dict) else {}
+    runtime_mismatches = []
     for key in ("provider", "model", "api_mode", "reasoning_effort"):
         expected = str(requirements.get(key) or "").strip()
         if not expected:
             continue
         actual = str(runtime.get(key) or "").strip()
         if actual != expected:
-            return (
-                False,
-                f"runtime requirement mismatch for {key}: expected {expected!r}, "
-                f"got {actual!r}",
-            )
-
-    gate = shell.contract.get("replacement_gate")
-    if not isinstance(gate, dict) or not gate:
+            runtime_mismatches.append((key, expected, actual))
+    if runtime_mismatches and not gate:
+        key, expected, actual = runtime_mismatches[0]
+        return (
+            False,
+            f"runtime requirement mismatch for {key}: expected {expected!r}, "
+            f"got {actual!r}",
+        )
+    if not gate:
         return True, ""
     baseline_executor_id = str(gate.get("baseline_executor_id") or "").strip()
     baseline_runtime = gate.get("baseline_runtime")
@@ -2804,7 +2815,13 @@ def _executor_runtime_contract_compatible(
 
     certification = executor.launch_config.get("hermes_repair_certification")
     if not isinstance(certification, dict):
-        return False, "Hermes maintainer replacement certification is required"
+        detail = ""
+        if runtime_mismatches:
+            key, expected, actual = runtime_mismatches[0]
+            detail = (
+                f" after {key} changed from {expected!r} to {actual!r}"
+            )
+        return False, "Hermes maintainer replacement certification is required" + detail
     if gate.get("require_operator_approval") and not certification.get(
         "operator_approved"
     ):
@@ -2815,6 +2832,11 @@ def _executor_runtime_contract_compatible(
         "critical_pass_rate",
         "default_branch_writes",
         "timeline_invalid_count",
+        "baseline_score_ratio",
+        "median_latency_ratio",
+        "benchmark_suite",
+        "benchmark_report_sha256",
+        "evaluated_executor_id",
     }
     missing_metrics = sorted(required_metrics - set(certification))
     if missing_metrics:
@@ -2832,6 +2854,12 @@ def _executor_runtime_contract_compatible(
         timeline_invalid_count = int(
             certification.get("timeline_invalid_count") or 0
         )
+        baseline_score_ratio = float(
+            certification.get("baseline_score_ratio") or 0
+        )
+        median_latency_ratio = float(
+            certification.get("median_latency_ratio") or 0
+        )
     except (TypeError, ValueError):
         return False, "Hermes maintainer replacement certification is malformed"
     if case_count < int(gate.get("minimum_cases") or 0):
@@ -2840,6 +2868,29 @@ def _executor_runtime_contract_compatible(
         return False, "Hermes maintainer replacement overall pass rate is too low"
     if critical_rate < float(gate.get("critical_pass_rate") or 0):
         return False, "Hermes maintainer replacement critical gate failed"
+    if baseline_score_ratio < float(
+        gate.get("minimum_baseline_score_ratio") or 0
+    ):
+        return False, "Hermes maintainer replacement benchmark score is too low"
+    maximum_latency_ratio = float(
+        gate.get("maximum_median_latency_ratio") or 0
+    )
+    if maximum_latency_ratio and median_latency_ratio > maximum_latency_ratio:
+        return False, "Hermes maintainer replacement median latency is too high"
+    expected_suite = str(gate.get("benchmark_suite") or "").strip()
+    if expected_suite and str(
+        certification.get("benchmark_suite") or ""
+    ).strip() != expected_suite:
+        return False, "Hermes maintainer replacement benchmark suite mismatch"
+    if str(certification.get("evaluated_executor_id") or "").strip() != executor.id:
+        return False, "Hermes maintainer replacement benchmark executor mismatch"
+    report_sha = str(
+        certification.get("benchmark_report_sha256") or ""
+    ).strip().lower()
+    if gate.get("require_benchmark_artifact") and (
+        len(report_sha) != 64 or any(char not in "0123456789abcdef" for char in report_sha)
+    ):
+        return False, "Hermes maintainer replacement benchmark artifact is invalid"
     if default_branch_writes > int(
         gate.get("maximum_default_branch_writes") or 0
     ):

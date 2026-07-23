@@ -66,6 +66,20 @@ execution adapters:
   and Hermes self-maintenance workers execute cards without acquiring
   project-manager authority. Ordinary project coding never escalates to the
   dedicated Hermes Maintainer merely because it is a repair request.
+- **Free worker routing:** OpenRouter strict-free and OpenCode free are
+  registered as low-priority candidates for every ordinary Role Shell, not
+  only as controller choices. Each task refreshes the live free catalog;
+  removed or exhausted models fall out and newly eligible models enter the
+  ordered fallback chain. OpenRouter uses server-side `models` fallback while
+  OpenCode uses Hermes' provider fallback chain. Neither is bound to
+  `hermes-repair` by default.
+- **Replaceable Hermes Maintainer:** `gpt-5.6-sol/high` remains the default,
+  but it is not an irreversible lock. A replacement must pass the separate
+  `hermes-repair-v1` benchmark (20+ cases, 95% overall, 100% critical, at
+  least 95% of baseline score, median latency no worse than 1.5x), provide a
+  SHA-256 benchmark artifact, prove source/config/conflict/push/rollback
+  cases, write no default branch, pass Timeline with zero invalid nodes, and
+  receive explicit operator approval before it can be assigned.
 - **Hard code-card approval gate:** proposing a code card creates only a
   durable `pa_*` approval request and puts the Project in `paused`. No Kanban
   task exists, and nothing can dispatch, until an operator approves it from

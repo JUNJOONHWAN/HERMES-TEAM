@@ -142,6 +142,10 @@ def test_hermes_maintainer_runtime_and_replacement_certification_fail_closed(tmp
                 "minimum_cases": 20,
                 "minimum_overall_pass_rate": 0.95,
                 "critical_pass_rate": 1.0,
+                "benchmark_suite": "hermes-repair-v1",
+                "minimum_baseline_score_ratio": 0.95,
+                "maximum_median_latency_ratio": 1.5,
+                "require_benchmark_artifact": True,
                 "maximum_default_branch_writes": 0,
                 "require_operator_approval": True,
                 "require_conflicting_adapter_result_case": True,
@@ -200,6 +204,11 @@ def test_hermes_maintainer_runtime_and_replacement_certification_fail_closed(tmp
             "critical_pass_rate": 1.0,
             "default_branch_writes": 0,
             "timeline_invalid_count": 0,
+            "baseline_score_ratio": 0.98,
+            "median_latency_ratio": 1.1,
+            "benchmark_suite": "hermes-repair-v1",
+            "benchmark_report_sha256": "a" * 64,
+            "evaluated_executor_id": "executor_certified",
             "conflicting_adapter_result_case": True,
             "config_and_source_cases": True,
             "branch_push_and_rollback": True,
@@ -218,19 +227,25 @@ def test_hermes_maintainer_runtime_and_replacement_certification_fail_closed(tmp
         conn, shell_value=shell.id, executor_value=certified.id
     ).executor_id == certified.id
 
-    wrong_model = sr.register_executor(
+    alternate_runtime = sr.register_executor(
         conn,
         executor_id="executor_wrong_model",
         name="wrong-model",
         adapter_type="command",
-        launch_config={**certified_launch, "model": "cheap-code-model"},
+        launch_config={
+            **certified_launch,
+            "model": "alternate-maintainer-model",
+            "hermes_repair_certification": {
+                **certified_launch["hermes_repair_certification"],
+                "evaluated_executor_id": "executor_wrong_model",
+            },
+        },
         capabilities=("file", "terminal", "kanban"),
         heartbeat_required=False,
     )
-    with pytest.raises(sr.SupervisorRegistryError, match="runtime requirement mismatch"):
-        sr.assign_adapter(
-            conn, shell_value=shell.id, executor_value=wrong_model.id
-        )
+    assert sr.assign_adapter(
+        conn, shell_value=shell.id, executor_value=alternate_runtime.id
+    ).executor_id == alternate_runtime.id
 
 
 def test_primary_owner_precedes_higher_priority_candidates(tmp_path):
@@ -2565,6 +2580,20 @@ def test_bootstrap_config_plan_removes_root_mcp_and_partitions_executor_profiles
     assert maintainer["model"]["openai_runtime"] == "codex_app_server"
     assert maintainer["model"]["api_mode"] == "codex_app_server"
     assert maintainer["agent"]["reasoning_effort"] == "high"
+    opencode_free = plan["profiles"]["hermes-worker-opencode-free"]
+    assert opencode_free["model"] == {
+        "default": bootstrap.OPENCODE_FREE_CONTROLLER_MODELS[0],
+        "provider": "opencode-zen",
+        "base_url": "https://opencode.ai/zen/v1",
+        "api_mode": "chat_completions",
+    }
+    assert opencode_free["fallback_model"] == [
+        {"provider": "opencode-zen", "model": model}
+        for model in bootstrap.OPENCODE_FREE_CONTROLLER_MODELS[1:]
+    ]
+    openrouter_free = plan["profiles"]["hermes-worker-openrouter-free"]
+    assert openrouter_free["model"]["provider"] == "openrouter"
+    assert openrouter_free["model"]["base_url"] == "https://openrouter.ai/api/v1"
     assert bootstrap.HEARTBEAT_DELIVERY == "local"
     assert plan["root"]["supervisor"]["required_cron"] == [
         "hermes-supervisor-heartbeat"
@@ -3650,8 +3679,8 @@ def test_supervisor_install_is_idempotent_in_isolated_home(tmp_path):
     conn = sqlite3.connect(home / "kanban.db")
     try:
         assert conn.execute("SELECT COUNT(*) FROM role_shells").fetchone()[0] == 8
-        assert conn.execute("SELECT COUNT(*) FROM executors").fetchone()[0] == 6
-        assert conn.execute("SELECT COUNT(*) FROM role_bindings").fetchone()[0] == 19
+        assert conn.execute("SELECT COUNT(*) FROM executors").fetchone()[0] == 8
+        assert conn.execute("SELECT COUNT(*) FROM role_bindings").fetchone()[0] == 33
         assert conn.execute(
             "SELECT COUNT(*) FROM controller_adapters"
         ).fetchone()[0] == 6
@@ -3707,5 +3736,30 @@ def test_supervisor_install_is_idempotent_in_isolated_home(tmp_path):
         assert conn.execute(
             "SELECT COUNT(*) FROM role_bindings WHERE responsibility='primary'"
         ).fetchone()[0] == 8
+        free_worker_rows = conn.execute(
+            "SELECT id,adapter_type,launch_config FROM executors "
+            "WHERE id IN (?,?) ORDER BY id",
+            (
+                "executor_hermes_worker_opencode_free",
+                "executor_hermes_worker_openrouter_free",
+            ),
+        ).fetchall()
+        assert len(free_worker_rows) == 2
+        assert {row[1] for row in free_worker_rows} == {"command"}
+        for row in free_worker_rows:
+            launch = json.loads(row[2])
+            assert "hermes_cli.free_worker_router" in json.dumps(launch)
+        hermes_repair_shell_id = conn.execute(
+            "SELECT shell_id FROM role_shell_heads WHERE shell_key='hermes-repair'"
+        ).fetchone()[0]
+        assert conn.execute(
+            "SELECT COUNT(*) FROM role_bindings WHERE shell_id=? "
+            "AND executor_id IN (?,?)",
+            (
+                hermes_repair_shell_id,
+                "executor_hermes_worker_opencode_free",
+                "executor_hermes_worker_openrouter_free",
+            ),
+        ).fetchone()[0] == 0
     finally:
         conn.close()

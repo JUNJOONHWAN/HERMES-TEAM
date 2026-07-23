@@ -253,6 +253,8 @@ def _run_agent(
     provider: Optional[str] = None,
     toolsets: object = None,
     use_config_toolsets: bool = True,
+    request_overrides: Optional[dict] = None,
+    fallback_model: Optional[list[dict]] = None,
 ) -> tuple[str, dict]:
     """Build an AIAgent exactly like a normal CLI chat turn would, then
     run a single conversation.  Returns ``(final_response, run_result)``."""
@@ -335,7 +337,25 @@ def _run_agent(
     session_db = _create_session_db_for_oneshot()
     # Read the effective fallback chain from profile config so oneshot workers
     # honour the same merge semantics as interactive CLI and gateway sessions.
-    _fb = get_fallback_chain(cfg)
+    _fb = (
+        list(fallback_model)
+        if fallback_model is not None
+        else get_fallback_chain(cfg)
+    )
+    runtime_overrides = runtime.get("request_overrides")
+    merged_request_overrides = (
+        dict(runtime_overrides) if isinstance(runtime_overrides, dict) else {}
+    )
+    if isinstance(request_overrides, dict):
+        for key, value in request_overrides.items():
+            if key == "extra_body" and isinstance(value, dict):
+                existing = merged_request_overrides.get("extra_body")
+                merged_request_overrides["extra_body"] = {
+                    **(dict(existing) if isinstance(existing, dict) else {}),
+                    **value,
+                }
+            else:
+                merged_request_overrides[key] = value
 
     agent = AIAgent(
         api_key=runtime.get("api_key"),
@@ -348,6 +368,7 @@ def _run_agent(
         platform="cli",
         session_db=session_db,
         credential_pool=runtime.get("credential_pool"),
+        request_overrides=merged_request_overrides or None,
         fallback_model=_fb or None,
         # Interactive callbacks are intentionally NOT wired beyond this
         # one.  In oneshot mode there's no user sitting at a terminal:
